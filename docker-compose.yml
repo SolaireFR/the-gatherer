@@ -1,0 +1,9 @@
+services:
+  veille-tech:
+    build: .
+    container_name: veille_tech_app
+    ports:
+      - "8800:8080"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

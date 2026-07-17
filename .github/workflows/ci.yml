@@ -1,6 +1,5 @@
 name: Build and Push Docker Image
 
-# Se déclenche à chaque push sur la branche principale (main ou master)
 on:
   push:
     branches:
@@ -9,25 +8,26 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # Convertit le nom du dépôt GitHub en minuscules pour l'image Docker
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write # Requis pour pousser l'image sur GHCR
+      packages: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Étape indispensable pour éviter de re-télécharger Go/Docker en partant de zéro à chaque fois
+      # Étape magique : on convertit le nom du dépôt en minuscules et on le stocke dans une variable globale
+      - name: Downcase repository name
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Connexion automatique à GHCR en utilisant le token généré par GitHub pour ce build
       - name: Log in to the Container Registry
         uses: docker/login-action@v3
         with:
@@ -35,13 +35,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build l'image et la pousse avec le tag 'latest'
+      # On utilise la variable ${{ env.IMAGE_NAME }} qui est maintenant garantie en minuscules
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          # Optimise la vitesse des builds suivants en mettant en cache les couches de l'image
           cache-from: type=gha
           cache-to: type=gha,mode=max

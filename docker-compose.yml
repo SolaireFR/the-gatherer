@@ -1,9 +1,13 @@
 services:
-  veille-tech:
+  app:
     build: .
-    container_name: veille_tech_app
+    container_name: the-gatherer-app
     ports:
       - "8800:8080"
     volumes:
       - ./data:/app/data
+    environment:
+      - NEWS_API_KEY=${NEWS_API_KEY}
+      - GNEWS_API_KEY=${GNEWS_API_KEY}
+      - CURRENTS_API_KEY=${CURRENTS_API_KEY}
     restart: unless-stopped

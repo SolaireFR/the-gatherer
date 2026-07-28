@@ -1,9 +1,13 @@
 services:
-  the-gatherer:
+  app:
     build: .
-    container_name: the-gatherer-go
+    container_name: the-gatherer-app
     volumes:
       - ./docker/volumes/the-gatherer:/app/data
+    environment:
+      - NEWS_API_KEY=${NEWS_API_KEY}
+      - GNEWS_API_KEY=${GNEWS_API_KEY}
+      - CURRENTS_API_KEY=${CURRENTS_API_KEY}
     restart: unless-stopped
     networks:
       - the-gatherer-network

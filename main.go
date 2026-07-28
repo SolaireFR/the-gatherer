@@ -36,7 +36,6 @@ type APISource struct {
 	Parse   func(body []byte) ([]Article, error)
 }
 
-// APIStatus conserve l'état de santé de chaque API
 type APIStatus struct {
 	SourceName string
 	ErrorMsg   string
@@ -44,15 +43,18 @@ type APIStatus struct {
 }
 
 // ==========================================
-// 2. GESTION DE L'ÉTAT DES APIs (Thread-Safe)
+// 2. GESTION DE L'ÉTAT ET DES DONNÉES EN MÉMOIRE
 // ==========================================
 
 var (
 	apiStatuses = make(map[string]APIStatus)
 	statusMutex sync.RWMutex
+
+	// Stockage en RAM temporaire pour afficher les news sans BDD
+	memArticles []Article
+	memMutex    sync.RWMutex
 )
 
-// setAPIStatus met à jour le statut d'une API. Si errMsg est vide, c'est un succès.
 func setAPIStatus(name string, errMsg string) {
 	statusMutex.Lock()
 	defer statusMutex.Unlock()
@@ -64,7 +66,7 @@ func setAPIStatus(name string, errMsg string) {
 }
 
 // ==========================================
-// 3. BASE DE DONNÉES & MIGRATIONS
+// 3. BASE DE DONNÉES (Actuellement désactivée)
 // ==========================================
 
 func initDB(filepath string) (*sql.DB, error) {
@@ -87,7 +89,6 @@ func initDB(filepath string) (*sql.DB, error) {
 	}
 
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN source TEXT DEFAULT 'Inconnue'`)
-
 	return db, nil
 }
 
@@ -108,46 +109,56 @@ func saveArticles(db *sql.DB, articles []Article) {
 	}
 }
 
-func getArticles(db *sql.DB, startDate, endDate string) ([]Article, error) {
-	query := `
-		SELECT id, title, description, date, link, source 
-		FROM articles 
-		WHERE date(date) >= date(?) AND date(date) <= date(?)
-		ORDER BY date DESC
-	`
-	rows, err := db.Query(query, startDate, endDate)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+// ==========================================
+// 4. PREPARATION API MISTRAL
+// ==========================================
 
-	var articles []Article
-	for rows.Next() {
-		var a Article
-		if err := rows.Scan(&a.ID, &a.Title, &a.Description, &a.Date, &a.Link, &a.Source); err != nil {
-			return nil, err
+// Structures pour l'endpoint chat de Mistral (https://api.mistral.ai/v1/chat/completions)
+type MistralMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type MistralRequest struct {
+	Model       string           `json:"model"`
+	Messages    []MistralMessage `json:"messages"`
+	Temperature float64          `json:"temperature,omitempty"`
+}
+
+// Crée le prompt contenant la liste des articles avec leur ID
+func buildMistralPrompt(articles []Article) string {
+	prompt := "Tu es un expert en veille technologique informatique.\n"
+	prompt += "Voici une liste d'articles récupérés aujourd'hui. Chaque article est précédé de son ID.\n"
+	prompt += "Analyse les titres et renvoie-moi UNIQUEMENT une liste des IDs séparés par des virgules (ex: 1, 5, 12) pour les articles les plus pertinents et techniques.\n\n"
+
+	for _, a := range articles {
+		// On limite un peu la description pour ne pas exploser les tokens si besoin
+		desc := a.Description
+		if len(desc) > 150 {
+			desc = desc[:150] + "..."
 		}
-		articles = append(articles, a)
+		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, a.Title, desc)
 	}
-	return articles, nil
+	return prompt
 }
 
 // ==========================================
-// 4. FETCH API GENERIQUE
+// 5. FETCH API GENERIQUE
 // ==========================================
 
 func fetchAllSources(db *sql.DB, sources []APISource) {
 	log.Println("Début de la récupération des articles...")
 	client := &http.Client{Timeout: 10 * time.Second}
 
+	var allFetchedArticles []Article
+	idCounter := 1 // Compteur pour assigner un ID unique à chaque article récupéré
+
 	for _, source := range sources {
 		log.Printf("Interrogation de %s...", source.Name)
 
 		req, err := http.NewRequest("GET", source.URL, nil)
 		if err != nil {
-			msg := fmt.Sprintf("Erreur création requête: %v", err)
-			log.Printf("[%s] %s", source.Name, msg)
-			setAPIStatus(source.Name, msg)
+			setAPIStatus(source.Name, fmt.Sprintf("Erreur création requête: %v", err))
 			continue
 		}
 
@@ -157,50 +168,63 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			msg := fmt.Sprintf("Erreur réseau: %v", err)
-			log.Printf("[%s] %s", source.Name, msg)
-			setAPIStatus(source.Name, msg)
+			setAPIStatus(source.Name, fmt.Sprintf("Erreur réseau: %v", err))
 			continue
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			msg := fmt.Sprintf("Erreur lecture réponse: %v", err)
-			log.Printf("[%s] %s", source.Name, msg)
-			setAPIStatus(source.Name, msg)
+			setAPIStatus(source.Name, fmt.Sprintf("Erreur lecture: %v", err))
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			msg := fmt.Sprintf("Code HTTP %d - Réponse: %s", resp.StatusCode, string(body))
-			log.Printf("[%s] %s", source.Name, msg)
-			setAPIStatus(source.Name, msg)
+			setAPIStatus(source.Name, fmt.Sprintf("Code HTTP %d - Réponse: %s", resp.StatusCode, string(body)))
 			continue
 		}
 
 		articles, err := source.Parse(body)
 		if err != nil {
-			msg := fmt.Sprintf("Erreur parsing JSON: %v", err)
-			log.Printf("[%s] %s", source.Name, msg)
-			setAPIStatus(source.Name, msg)
+			setAPIStatus(source.Name, fmt.Sprintf("Erreur parsing JSON: %v", err))
 			continue
 		}
 
+		// Préparation des articles avec attribution de l'ID temporaire
 		for i := range articles {
 			articles[i].Source = source.Name
+			articles[i].ID = idCounter
+			idCounter++
+			allFetchedArticles = append(allFetchedArticles, articles[i])
 		}
 
-		saveArticles(db, articles)
-		log.Printf("[%s] %d articles traités.\n", source.Name, len(articles))
-		
-		// Si on arrive ici, l'API fonctionne parfaitement, on efface les erreurs précédentes
+		log.Printf("[%s] %d articles récupérés.\n", source.Name, len(articles))
 		setAPIStatus(source.Name, "")
 	}
+
+	// SAUVEGARDE BDD COMMENTÉE POUR L'INSTANT[cite: 6]
+	// saveArticles(db, allFetchedArticles) 
+	// log.Println("Articles sauvegardés en BDD.")
+
+	// PRÉPARATION MISTRAL
+	mistralKey := os.Getenv("MISTRAL_API_KEY")
+	if mistralKey != "" && len(allFetchedArticles) > 0 {
+		prompt := buildMistralPrompt(allFetchedArticles)
+		log.Println("🤖 Prompt Mistral généré (Prêt à être envoyé) :")
+		log.Println(prompt[:200] + "... (tronqué pour les logs)")
+		
+		// TODO: Ici viendra la requête HTTP POST vers https://api.mistral.ai/v1/chat/completions
+	}
+
+	// Mise à jour de la mémoire pour affichage Web
+	memMutex.Lock()
+	memArticles = allFetchedArticles
+	memMutex.Unlock()
+	log.Printf("Mise à jour de la mémoire avec %d articles.", len(allFetchedArticles))
 }
 
 // ==========================================
-// 5. CRON (TICKER)
+// 6. CRON (TICKER)
 // ==========================================
 
 func startCron(db *sql.DB, sources []APISource) {
@@ -215,7 +239,7 @@ func startCron(db *sql.DB, sources []APISource) {
 }
 
 // ==========================================
-// 6. SERVEUR WEB ET HTML
+// 7. SERVEUR WEB ET HTML
 // ==========================================
 
 const htmlTemplate = `
@@ -231,12 +255,13 @@ const htmlTemplate = `
         .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1.1em; }
         .error-item { margin-bottom: 8px; font-size: 0.9em; color: #333; }
         .error-item strong { color: #b71c1c; }
-        .article { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .article { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid #0056b3; }
         .article h2 { margin-top: 0; font-size: 1.3em; }
         .article a { color: #0056b3; text-decoration: none; }
         .article a:hover { text-decoration: underline; }
-        .meta { color: #666; font-size: 0.85em; margin-bottom: 10px; display: flex; gap: 15px; }
+        .meta { color: #666; font-size: 0.85em; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; }
         .source { background: #e2e8f0; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
+        .id-badge { background: #ff9800; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
         form { margin-bottom: 30px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         input[type="date"], button { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
         button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
@@ -257,17 +282,16 @@ const htmlTemplate = `
     </div>
     {{end}}
     
-    <form method="GET" action="/">
-        <label>Du : <input type="date" name="start" value="{{.Start}}"></label>
-        <label>Au : <input type="date" name="end" value="{{.End}}"></label>
-        <button type="submit">Filtrer</button>
-    </form>
+    <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
+        ℹ️ <strong>Mode Live :</strong> Les articles affichés sont directement récupérés depuis la mémoire (BDD désactivée). Chaque article possède un <strong>ID temporaire</strong> prêt pour l'analyse Mistral.
+    </div>
 
     {{if .Articles}}
         {{range .Articles}}
         <div class="article">
             <h2><a href="{{.Link}}" target="_blank">{{.Title}}</a></h2>
             <div class="meta">
+                <span class="id-badge">ID: {{.ID}}</span>
                 <span class="source">{{.Source}}</span>
                 <span>📅 {{.Date}}</span>
             </div>
@@ -275,7 +299,7 @@ const htmlTemplate = `
         </div>
         {{end}}
     {{else}}
-        <p>Aucun article trouvé pour ces dates.</p>
+        <p>Aucun article récupéré pour le moment (en attente du cron).</p>
     {{end}}
 </body>
 </html>
@@ -285,22 +309,18 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		start := r.URL.Query().Get("start")
-		end := r.URL.Query().Get("end")
+		// REQUÊTE EN BDD COMMENTÉE[cite: 6]
+		/*
+			start := r.URL.Query().Get("start")
+			end := r.URL.Query().Get("end")
+			articles, err := getArticles(db, start, end)
+		*/
 
-		today := time.Now().Format("2006-01-02")
-		if start == "" {
-			start = today
-		}
-		if end == "" {
-			end = today
-		}
-
-		articles, err := getArticles(db, start, end)
-		if err != nil {
-			http.Error(w, "Erreur serveur", http.StatusInternalServerError)
-			return
-		}
+		// LECTURE DEPUIS LA MÉMOIRE RAM DIRECTEMENT
+		memMutex.RLock()
+		articles := make([]Article, len(memArticles))
+		copy(articles, memArticles)
+		memMutex.RUnlock()
 
 		// Récupération des erreurs API actives
 		statusMutex.RLock()
@@ -312,7 +332,6 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 		}
 		statusMutex.RUnlock()
 
-		// Tri alphabétique pour un affichage stable sur le front
 		sort.Slice(activeErrors, func(i, j int) bool {
 			return activeErrors[i].SourceName < activeErrors[j].SourceName
 		})
@@ -322,12 +341,12 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			End      string
 			Articles []Article
 			Errors   []APIStatus
-		}{start, end, articles, activeErrors})
+		}{"", "", articles, activeErrors})
 	}
 }
 
 // ==========================================
-// 7. MAIN & CONFIGURATION DES APIs
+// 8. MAIN & CONFIGURATION DES APIs
 // ==========================================
 
 func main() {

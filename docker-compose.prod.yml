@@ -1,0 +1,14 @@
+services:
+  the-gatherer:
+    build: .
+    container_name: the-gatherer-go
+    volumes:
+      - ./docker/volumes/the-gatherer:/app/data
+    restart: unless-stopped
+    networks:
+      - the-gatherer-network
+
+networks:
+  the-gatherer-network:
+    name: the-gatherer-network
+    driver: bridge

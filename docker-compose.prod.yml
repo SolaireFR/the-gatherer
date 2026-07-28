@@ -1,6 +1,6 @@
 services:
   app:
-    build: .
+    image: ghcr.io/solairefr/the-gatherer:latest
     container_name: the-gatherer-app
     volumes:
       - ./docker/volumes/the-gatherer:/app/data

@@ -243,7 +243,7 @@ const htmlTemplate = `
     </style>
 </head>
 <body>
-    <h1>🚀 The Gatherer - Veille Informatique</h1>
+    <h1>🚀 The Gatherer - Veille</h1>
 
     {{if .Errors}}
     <div class="errors-container">

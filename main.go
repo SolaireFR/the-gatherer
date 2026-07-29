@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -21,12 +24,13 @@ import (
 // ==========================================
 
 type Article struct {
-	ID          int
-	Title       string
-	Description string
-	Date        string
-	Link        string
-	Source      string
+	ID           int
+	Title        string
+	Description  string
+	Date         string
+	Link         string
+	Source       string
+	MistralValid bool // Nouveau champ pour le tag Mistral
 }
 
 type APISource struct {
@@ -50,9 +54,13 @@ var (
 	apiStatuses = make(map[string]APIStatus)
 	statusMutex sync.RWMutex
 
-	// Stockage en RAM temporaire pour afficher les news sans BDD
+	// Stockage en RAM temporaire
 	memArticles []Article
 	memMutex    sync.RWMutex
+
+	// Sauvegarde pour l'affichage HTML
+	lastMistralPrompt   string
+	lastMistralResponse string
 )
 
 func setAPIStatus(name string, errMsg string) {
@@ -113,7 +121,6 @@ func saveArticles(db *sql.DB, articles []Article) {
 // 4. PREPARATION API MISTRAL
 // ==========================================
 
-// Structures pour l'endpoint chat de Mistral (https://api.mistral.ai/v1/chat/completions)
 type MistralMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
@@ -125,25 +132,28 @@ type MistralRequest struct {
 	Temperature float64          `json:"temperature,omitempty"`
 }
 
-// Crée le prompt contenant la liste des articles avec leur ID
 func buildMistralPrompt(articles []Article) string {
 	prompt := "Tu es un expert en veille technologique informatique.\n"
 	prompt += "Voici une liste d'articles récupérés aujourd'hui. Chaque article est précédé de son ID.\n"
-	prompt += "Analyse les titres et renvoie-moi UNIQUEMENT une liste des IDs séparés par des virgules (ex: 1, 5, 12) pour les articles les plus pertinents et techniques.\n\n"
+	prompt += "Analyse puis filtre les titres qui sont pertinents pour la veille technologique (ex: nouvelles technologies, langages de programmation, frameworks, IA, IDE, logiciels, etc.)\n"
+	prompt += "Renvoie-moi UNIQUEMENT une liste des IDs séparés par des virgules (ex: [1, 5, 12]).\n\n"
 
 	for _, a := range articles {
-		// On limite un peu la description pour ne pas exploser les tokens si besoin
+		title := a.Title
+		if len(title) > 100 {
+			title = title[:100] + "..."
+		}
 		desc := a.Description
 		if len(desc) > 150 {
 			desc = desc[:150] + "..."
 		}
-		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, a.Title, desc)
+		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, title, desc)
 	}
 	return prompt
 }
 
 // ==========================================
-// 5. FETCH API GENERIQUE
+// 5. FETCH API GENERIQUE ET APPEL MISTRAL
 // ==========================================
 
 func fetchAllSources(db *sql.DB, sources []APISource) {
@@ -151,7 +161,7 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	var allFetchedArticles []Article
-	idCounter := 1 // Compteur pour assigner un ID unique à chaque article récupéré
+	idCounter := 1
 
 	for _, source := range sources {
 		log.Printf("Interrogation de %s...", source.Name)
@@ -190,7 +200,6 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 			continue
 		}
 
-		// Préparation des articles avec attribution de l'ID temporaire
 		for i := range articles {
 			articles[i].Source = source.Name
 			articles[i].ID = idCounter
@@ -202,21 +211,84 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		setAPIStatus(source.Name, "")
 	}
 
-	// SAUVEGARDE BDD COMMENTÉE POUR L'INSTANT[cite: 6]
-	// saveArticles(db, allFetchedArticles) 
-	// log.Println("Articles sauvegardés en BDD.")
-
-	// PRÉPARATION MISTRAL
+	// APPEL MISTRAL
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
 	if mistralKey != "" && len(allFetchedArticles) > 0 {
 		prompt := buildMistralPrompt(allFetchedArticles)
-		log.Println("🤖 Prompt Mistral généré (Prêt à être envoyé) :")
-		log.Println(prompt[:200] + "... (tronqué pour les logs)")
-		
-		// TODO: Ici viendra la requête HTTP POST vers https://api.mistral.ai/v1/chat/completions
+		log.Println("🤖 Envoi de la requête à Mistral...")
+
+		// Construction de la requête[cite: 1]
+		reqBody := MistralRequest{
+			Model: "mistral-large-latest",
+			Messages: []MistralMessage{
+				{Role: "user", Content: prompt},
+			},
+		}
+		jsonBody, _ := json.Marshal(reqBody)
+
+		req, _ := http.NewRequest("POST", "https://api.mistral.ai/v1/chat/completions", bytes.NewBuffer(jsonBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+mistralKey)
+
+		mistralClient := &http.Client{Timeout: 30 * time.Second}
+		resp, err := mistralClient.Do(req)
+
+		var fullResponseStr string
+		if err != nil {
+			fullResponseStr = fmt.Sprintf("Erreur HTTP: %v", err)
+			log.Println(fullResponseStr)
+		} else {
+			// Capture de TOUTE la réponse (Headers inclus)
+			headersStr := ""
+			for k, v := range resp.Header {
+				headersStr += fmt.Sprintf("%s: %v\n", k, v)
+			}
+
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			fullResponseStr = fmt.Sprintf("Status: %s\n\n--- HEADERS ---\n%s\n--- BODY ---\n%s", resp.Status, headersStr, string(bodyBytes))
+
+			// Parsing pour valider les articles
+			var mistralResp struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+			}
+			json.Unmarshal(bodyBytes, &mistralResp)
+
+			if len(mistralResp.Choices) > 0 {
+				content := mistralResp.Choices[0].Message.Content
+				// Extraction des IDs avec regex
+				re := regexp.MustCompile(`\d+`)
+				matches := re.FindAllString(content, -1)
+
+				validIDs := make(map[int]bool)
+				for _, m := range matches {
+					if id, err := strconv.Atoi(m); err == nil {
+						validIDs[id] = true
+					}
+				}
+
+				// Modification des articles récupérés
+				for i := range allFetchedArticles {
+					if validIDs[allFetchedArticles[i].ID] {
+						allFetchedArticles[i].MistralValid = true
+					}
+				}
+			}
+		}
+
+		// Sauvegarde HTML
+		memMutex.Lock()
+		lastMistralPrompt = prompt
+		lastMistralResponse = fullResponseStr
+		memMutex.Unlock()
 	}
 
-	// Mise à jour de la mémoire pour affichage Web
+	// Mise à jour de la mémoire globale
 	memMutex.Lock()
 	memArticles = allFetchedArticles
 	memMutex.Unlock()
@@ -250,7 +322,7 @@ const htmlTemplate = `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>The Gatherer - Veille</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; }
         .errors-container { background: #ffebee; border-left: 5px solid #f44336; padding: 15px; margin-bottom: 30px; border-radius: 4px; }
         .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1.1em; }
         .error-item { margin-bottom: 8px; font-size: 0.9em; color: #333; }
@@ -262,9 +334,9 @@ const htmlTemplate = `
         .meta { color: #666; font-size: 0.85em; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; }
         .source { background: #e2e8f0; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
         .id-badge { background: #ff9800; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-        form { margin-bottom: 30px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        input[type="date"], button { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
-        button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
+        .mistral-badge { background: #4caf50; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+        .debug-panel { background: #2d2d2d; color: #8bc34a; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-family: monospace; overflow-x: auto; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .debug-panel h3 { color: #fff; margin-top: 0; font-family: Arial, sans-serif; }
     </style>
 </head>
 <body>
@@ -283,9 +355,22 @@ const htmlTemplate = `
     {{end}}
     
     <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-        ℹ️ <strong>Mode Live :</strong> Les articles affichés sont directement récupérés depuis la mémoire (BDD désactivée). Chaque article possède un <strong>ID temporaire</strong> prêt pour l'analyse Mistral.
+        ℹ️ <strong>Mode Live :</strong> Les articles affichés sont directement récupérés depuis la mémoire (BDD désactivée). 
     </div>
 
+    <!-- LOGS MISTRAL -->
+    {{if .MistralPrompt}}
+    <div class="debug-panel">
+        <h3>🤖 Prompt Mistral Envoyé</h3>
+        <pre>{{.MistralPrompt}}</pre>
+    </div>
+    <div class="debug-panel">
+        <h3>📥 Réponse Mistral (Complète)</h3>
+        <pre>{{.MistralResponse}}</pre>
+    </div>
+    {{end}}
+
+    <!-- LISTE ARTICLES -->
     {{if .Articles}}
         {{range .Articles}}
         <div class="article">
@@ -294,6 +379,9 @@ const htmlTemplate = `
                 <span class="id-badge">ID: {{.ID}}</span>
                 <span class="source">{{.Source}}</span>
                 <span>📅 {{.Date}}</span>
+                {{if .MistralValid}}
+                    <span class="mistral-badge">✨ Validé par l'IA</span>
+                {{end}}
             </div>
             <p>{{.Description}}</p>
         </div>
@@ -309,20 +397,13 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		// REQUÊTE EN BDD COMMENTÉE[cite: 6]
-		/*
-			start := r.URL.Query().Get("start")
-			end := r.URL.Query().Get("end")
-			articles, err := getArticles(db, start, end)
-		*/
-
-		// LECTURE DEPUIS LA MÉMOIRE RAM DIRECTEMENT
 		memMutex.RLock()
 		articles := make([]Article, len(memArticles))
 		copy(articles, memArticles)
+		mPrompt := lastMistralPrompt
+		mResponse := lastMistralResponse
 		memMutex.RUnlock()
 
-		// Récupération des erreurs API actives
 		statusMutex.RLock()
 		var activeErrors []APIStatus
 		for _, status := range apiStatuses {
@@ -335,13 +416,17 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 		sort.Slice(activeErrors, func(i, j int) bool {
 			return activeErrors[i].SourceName < activeErrors[j].SourceName
 		})
-
+		// DONT DISPLAY PROMPT
+		mPrompt = ""
+		mResponse = ""
 		tmpl.Execute(w, struct {
-			Start    string
-			End      string
-			Articles []Article
-			Errors   []APIStatus
-		}{"", "", articles, activeErrors})
+			Start           string
+			End             string
+			Articles        []Article
+			Errors          []APIStatus
+			MistralPrompt   string
+			MistralResponse string
+		}{"", "", articles, activeErrors, mPrompt, mResponse})
 	}
 }
 

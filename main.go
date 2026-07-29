@@ -30,7 +30,7 @@ type Article struct {
 	Date         string
 	Link         string
 	Source       string
-	MistralValid bool // Nouveau champ pour le tag Mistral
+	MistralValid bool
 }
 
 type APISource struct {
@@ -47,20 +47,12 @@ type APIStatus struct {
 }
 
 // ==========================================
-// 2. GESTION DE L'ÉTAT ET DES DONNÉES EN MÉMOIRE
+// 2. GESTION DE L'ÉTAT ET DES ERREURS
 // ==========================================
 
 var (
 	apiStatuses = make(map[string]APIStatus)
 	statusMutex sync.RWMutex
-
-	// Stockage en RAM temporaire
-	memArticles []Article
-	memMutex    sync.RWMutex
-
-	// Sauvegarde pour l'affichage HTML
-	lastMistralPrompt   string
-	lastMistralResponse string
 )
 
 func setAPIStatus(name string, errMsg string) {
@@ -74,7 +66,7 @@ func setAPIStatus(name string, errMsg string) {
 }
 
 // ==========================================
-// 3. BASE DE DONNÉES (Actuellement désactivée)
+// 3. BASE DE DONNÉES
 // ==========================================
 
 func initDB(filepath string) (*sql.DB, error) {
@@ -96,7 +88,10 @@ func initDB(filepath string) (*sql.DB, error) {
 		return nil, err
 	}
 
+	// Mises à jour du schéma (ignorées si elles existent déjà)
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN source TEXT DEFAULT 'Inconnue'`)
+	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`)
+
 	return db, nil
 }
 
@@ -117,6 +112,43 @@ func saveArticles(db *sql.DB, articles []Article) {
 	}
 }
 
+// Récupère les articles de la BDD (Dernières 24H par défaut ou selon les filtres)
+func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
+	query := `SELECT id, title, description, date, link, source FROM articles WHERE 1=1`
+	var args []interface{}
+
+	if start != "" {
+		query += ` AND created_at >= ?`
+		args = append(args, start+" 00:00:00")
+	} else {
+		// Par défaut : les dernières 24 heures d'insertion
+		query += ` AND created_at >= datetime('now', '-1 day')`
+	}
+
+	if end != "" {
+		query += ` AND created_at <= ?`
+		args = append(args, end+" 23:59:59")
+	}
+
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var articles []Article
+	for rows.Next() {
+		var a Article
+		if err := rows.Scan(&a.ID, &a.Title, &a.Description, &a.Date, &a.Link, &a.Source); err == nil {
+			a.MistralValid = true // S'il est en BDD, c'est qu'il a été validé par l'IA
+			articles = append(articles, a)
+		}
+	}
+	return articles, nil
+}
+
 // ==========================================
 // 4. PREPARATION API MISTRAL
 // ==========================================
@@ -133,10 +165,13 @@ type MistralRequest struct {
 }
 
 func buildMistralPrompt(articles []Article) string {
-	prompt := "Tu es un expert en veille technologique informatique.\n"
-	prompt += "Voici une liste d'articles récupérés aujourd'hui. Chaque article est précédé de son ID.\n"
-	prompt += "Analyse puis filtre les titres qui sont pertinents pour la veille technologique (ex: nouvelles technologies, langages de programmation, frameworks, IA, IDE, logiciels, etc.)\n"
-	prompt += "Renvoie-moi UNIQUEMENT une liste des IDs séparés par des virgules (ex: [1, 5, 12]).\n\n"
+	prompt := "Tu es un développeur logiciel senior chargé de filtrer une veille technique et technologique.\n"
+	prompt += "Voici une liste d'articles avec leur ID.\n\n"
+	prompt += "RÈGLES DE SÉLECTION :\n"
+	prompt += "- INCLURE : Articles 100% concrets et techniques utiles à un développeur (ex: Go, Angular, NestJS, Flutter, Docker, architecture logicielle, auto-hébergement, LLM locaux, sécurité, CI/CD).\n"
+	prompt += "- EXCLURE : Les sujets abstraits, la tech grand public (nouveaux smartphones), les levées de fonds, la cryptomonnaie, la politique, ou l'éthique de l'IA.\n\n"
+	prompt += "Format de réponse exigé : Renvoie UNIQUEMENT un tableau JSON contenant les IDs pertinents, sans aucun autre texte. Exemple : [1, 5, 12]\n\n"
+	prompt += "Articles :\n"
 
 	for _, a := range articles {
 		title := a.Title
@@ -207,19 +242,19 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 			allFetchedArticles = append(allFetchedArticles, articles[i])
 		}
 
-		log.Printf("[%s] %d articles récupérés.\n", source.Name, len(articles))
 		setAPIStatus(source.Name, "")
 	}
 
-	// APPEL MISTRAL
+	log.Printf("Total de %d articles bruts récupérés. Envoi à Mistral...", len(allFetchedArticles))
+
+	// APPEL MISTRAL ET SAUVEGARDE EN BDD
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
 	if mistralKey != "" && len(allFetchedArticles) > 0 {
 		prompt := buildMistralPrompt(allFetchedArticles)
-		log.Println("🤖 Envoi de la requête à Mistral...")
-
-		// Construction de la requête[cite: 1]
+		
 		reqBody := MistralRequest{
-			Model: "mistral-large-latest",
+			Model:       "mistral-large-latest",
+			Temperature: 0.1,
 			Messages: []MistralMessage{
 				{Role: "user", Content: prompt},
 			},
@@ -233,78 +268,76 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		mistralClient := &http.Client{Timeout: 30 * time.Second}
 		resp, err := mistralClient.Do(req)
 
-		var fullResponseStr string
 		if err != nil {
-			fullResponseStr = fmt.Sprintf("Erreur HTTP: %v", err)
-			log.Println(fullResponseStr)
-		} else {
-			// Capture de TOUTE la réponse (Headers inclus)
-			headersStr := ""
-			for k, v := range resp.Header {
-				headersStr += fmt.Sprintf("%s: %v\n", k, v)
-			}
-
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-
-			fullResponseStr = fmt.Sprintf("Status: %s\n\n--- HEADERS ---\n%s\n--- BODY ---\n%s", resp.Status, headersStr, string(bodyBytes))
-
-			// Parsing pour valider les articles
-			var mistralResp struct {
-				Choices []struct {
-					Message struct {
-						Content string `json:"content"`
-					} `json:"message"`
-				} `json:"choices"`
-			}
-			json.Unmarshal(bodyBytes, &mistralResp)
-
-			if len(mistralResp.Choices) > 0 {
-				content := mistralResp.Choices[0].Message.Content
-				// Extraction des IDs avec regex
-				re := regexp.MustCompile(`\d+`)
-				matches := re.FindAllString(content, -1)
-
-				validIDs := make(map[int]bool)
-				for _, m := range matches {
-					if id, err := strconv.Atoi(m); err == nil {
-						validIDs[id] = true
-					}
-				}
-
-				// Modification des articles récupérés
-				for i := range allFetchedArticles {
-					if validIDs[allFetchedArticles[i].ID] {
-						allFetchedArticles[i].MistralValid = true
-					}
-				}
-			}
+			log.Println("Erreur HTTP Mistral:", err)
+			return
 		}
 
-		// Sauvegarde HTML
-		memMutex.Lock()
-		lastMistralPrompt = prompt
-		lastMistralResponse = fullResponseStr
-		memMutex.Unlock()
-	}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-	// Mise à jour de la mémoire globale
-	memMutex.Lock()
-	memArticles = allFetchedArticles
-	memMutex.Unlock()
-	log.Printf("Mise à jour de la mémoire avec %d articles.", len(allFetchedArticles))
+		var mistralResp struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		json.Unmarshal(bodyBytes, &mistralResp)
+
+		if len(mistralResp.Choices) > 0 {
+			content := mistralResp.Choices[0].Message.Content
+			re := regexp.MustCompile(`\d+`)
+			matches := re.FindAllString(content, -1)
+
+			validIDs := make(map[int]bool)
+			for _, m := range matches {
+				if id, err := strconv.Atoi(m); err == nil {
+					validIDs[id] = true
+				}
+			}
+
+			// On isole uniquement les articles validés par l'IA
+			var validArticles []Article
+			for i := range allFetchedArticles {
+				if validIDs[allFetchedArticles[i].ID] {
+					allFetchedArticles[i].MistralValid = true
+					validArticles = append(validArticles, allFetchedArticles[i])
+				}
+			}
+
+			// SAUVEGARDE EN BDD : Uniquement les articles validés !
+			saveArticles(db, validArticles)
+			log.Printf("✅ %d articles validés par Mistral ont été sauvegardés en BDD.", len(validArticles))
+		}
+	}
 }
 
 // ==========================================
-// 6. CRON (TICKER)
+// 6. CRON (TICKER INTELLIGENT)
 // ==========================================
 
 func startCron(db *sql.DB, sources []APISource) {
+	// Exécution au démarrage
 	fetchAllSources(db, sources)
 
-	ticker := time.NewTicker(24 * time.Hour)
 	go func() {
-		for range ticker.C {
+		for {
+			now := time.Now()
+			// Calcul de la date de la prochaine exécution à 5h00
+			next := time.Date(now.Year(), now.Month(), now.Day(), 5, 0, 0, 0, now.Location())
+			
+			// Si on a déjà passé 5h00 aujourd'hui, on planifie pour demain à 5h00
+			if now.After(next) {
+				next = next.Add(24 * time.Hour)
+			}
+			
+			duration := next.Sub(now)
+			log.Printf("Prochaine récupération prévue dans %v (à %v)", duration, next.Format("2006-01-02 15:04:05"))
+			
+			// Le programme se met en pause jusqu'à l'heure cible
+			time.Sleep(duration)
+			
 			fetchAllSources(db, sources)
 		}
 	}()
@@ -327,16 +360,17 @@ const htmlTemplate = `
         .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1.1em; }
         .error-item { margin-bottom: 8px; font-size: 0.9em; color: #333; }
         .error-item strong { color: #b71c1c; }
+        form { margin-bottom: 30px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        input[type="date"], button { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
+        button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
+        .reset-btn { text-decoration: none; padding: 8px 12px; background: #e0e0e0; border-radius: 4px; color: #333; font-size: 0.9em; }
         .article { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid #0056b3; }
         .article h2 { margin-top: 0; font-size: 1.3em; }
         .article a { color: #0056b3; text-decoration: none; }
         .article a:hover { text-decoration: underline; }
         .meta { color: #666; font-size: 0.85em; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; }
         .source { background: #e2e8f0; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
-        .id-badge { background: #ff9800; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
         .mistral-badge { background: #4caf50; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
-        .debug-panel { background: #2d2d2d; color: #8bc34a; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-family: monospace; overflow-x: auto; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .debug-panel h3 { color: #fff; margin-top: 0; font-family: Arial, sans-serif; }
     </style>
 </head>
 <body>
@@ -354,21 +388,12 @@ const htmlTemplate = `
     </div>
     {{end}}
     
-    <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px;">
-        ℹ️ <strong>Mode Live :</strong> Les articles affichés sont directement récupérés depuis la mémoire (BDD désactivée). 
-    </div>
-
-    <!-- LOGS MISTRAL -->
-    {{if .MistralPrompt}}
-    <div class="debug-panel">
-        <h3>🤖 Prompt Mistral Envoyé</h3>
-        <pre>{{.MistralPrompt}}</pre>
-    </div>
-    <div class="debug-panel">
-        <h3>📥 Réponse Mistral (Complète)</h3>
-        <pre>{{.MistralResponse}}</pre>
-    </div>
-    {{end}}
+    <form method="GET" action="/">
+        <label>Du :</label> <input type="date" name="start" value="{{.Start}}">
+        <label>Au :</label> <input type="date" name="end" value="{{.End}}">
+        <button type="submit">Filtrer</button>
+        <a href="/" class="reset-btn">Reset (24H)</a>
+    </form>
 
     <!-- LISTE ARTICLES -->
     {{if .Articles}}
@@ -376,7 +401,6 @@ const htmlTemplate = `
         <div class="article">
             <h2><a href="{{.Link}}" target="_blank">{{.Title}}</a></h2>
             <div class="meta">
-                <span class="id-badge">ID: {{.ID}}</span>
                 <span class="source">{{.Source}}</span>
                 <span>📅 {{.Date}}</span>
                 {{if .MistralValid}}
@@ -387,7 +411,7 @@ const htmlTemplate = `
         </div>
         {{end}}
     {{else}}
-        <p>Aucun article récupéré pour le moment (en attente du cron).</p>
+        <p>Aucun article technique pertinent trouvé pour cette période.</p>
     {{end}}
 </body>
 </html>
@@ -397,12 +421,14 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		memMutex.RLock()
-		articles := make([]Article, len(memArticles))
-		copy(articles, memArticles)
-		mPrompt := lastMistralPrompt
-		mResponse := lastMistralResponse
-		memMutex.RUnlock()
+		start := r.URL.Query().Get("start")
+		end := r.URL.Query().Get("end")
+
+		// Récupération depuis la BDD directement
+		articles, err := getArticles(db, start, end)
+		if err != nil {
+			log.Println("Erreur lors de la récupération des articles BDD:", err)
+		}
 
 		statusMutex.RLock()
 		var activeErrors []APIStatus
@@ -416,17 +442,13 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 		sort.Slice(activeErrors, func(i, j int) bool {
 			return activeErrors[i].SourceName < activeErrors[j].SourceName
 		})
-		// DONT DISPLAY PROMPT
-		mPrompt = ""
-		mResponse = ""
+
 		tmpl.Execute(w, struct {
-			Start           string
-			End             string
-			Articles        []Article
-			Errors          []APIStatus
-			MistralPrompt   string
-			MistralResponse string
-		}{"", "", articles, activeErrors, mPrompt, mResponse})
+			Start    string
+			End      string
+			Articles []Article
+			Errors   []APIStatus
+		}{start, end, articles, activeErrors})
 	}
 }
 

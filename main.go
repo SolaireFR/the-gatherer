@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +46,14 @@ type APIStatus struct {
 	SourceName string
 	ErrorMsg   string
 	LastCheck  string
+}
+
+// Criterion : un critère de recherche modifiable depuis le site.
+// Kind vaut "include" (sujet recherché) ou "exclude" (sujet bloqué).
+type Criterion struct {
+	ID    int
+	Label string
+	Kind  string
 }
 
 // ==========================================
@@ -93,7 +102,58 @@ func initDB(filepath string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN source TEXT DEFAULT 'Inconnue'`)
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`)
 
+	// Table des critères de recherche envoyés à l'IA
+	criteriaQuery := `
+	CREATE TABLE IF NOT EXISTS criteria (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		label TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		UNIQUE(label, kind)
+	);`
+
+	if _, err = db.Exec(criteriaQuery); err != nil {
+		return nil, err
+	}
+
 	return db, nil
+}
+
+// getCriteria renvoie tous les critères d'un type donné ("include" ou "exclude").
+func getCriteria(db *sql.DB, kind string) ([]Criterion, error) {
+	rows, err := db.Query(`SELECT id, label, kind FROM criteria WHERE kind = ? ORDER BY id`, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var criteria []Criterion
+	for rows.Next() {
+		var c Criterion
+		if err := rows.Scan(&c.ID, &c.Label, &c.Kind); err == nil {
+			criteria = append(criteria, c)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return criteria, nil
+}
+
+func addCriterion(db *sql.DB, label string, kind string) {
+	label = strings.TrimSpace(label)
+	if label == "" || (kind != "include" && kind != "exclude") {
+		return
+	}
+	_, err := db.Exec(`INSERT OR IGNORE INTO criteria (label, kind) VALUES (?, ?)`, label, kind)
+	if err != nil {
+		log.Println("Erreur ajout critère:", err)
+	}
+}
+
+func deleteCriterion(db *sql.DB, id int) {
+	if _, err := db.Exec(`DELETE FROM criteria WHERE id = ?`, id); err != nil {
+		log.Println("Erreur suppression critère:", err)
+	}
 }
 
 func saveArticles(db *sql.DB, articles []Article) {
@@ -168,12 +228,26 @@ type MistralRequest struct {
 	Temperature float64          `json:"temperature,omitempty"`
 }
 
-func buildMistralPrompt(articles []Article) string {
+// labels extrait les libellés d'une liste de critères.
+func labels(criteria []Criterion) []string {
+	var out []string
+	for _, c := range criteria {
+		out = append(out, c.Label)
+	}
+	return out
+}
+
+func buildMistralPrompt(articles []Article, includes []Criterion, excludes []Criterion) string {
 	prompt := "Tu es un développeur logiciel senior chargé de filtrer une veille technique et technologique.\n"
 	prompt += "Voici une liste d'articles avec leur ID.\n\n"
 	prompt += "RÈGLES DE SÉLECTION :\n"
-	prompt += "- INCLURE : Articles 100% concrets et techniques utiles à un développeur (ex: Go, Angular, NestJS, Flutter, Docker, architecture logicielle, auto-hébergement, LLM locaux, sécurité, CI/CD).\n"
-	prompt += "- EXCLURE : Les sujets abstraits, la tech grand public (nouveaux smartphones), les levées de fonds, la cryptomonnaie, la politique, ou l'éthique de l'IA.\n\n"
+	if len(includes) > 0 {
+		prompt += fmt.Sprintf("- INCLURE : Articles 100%% concrets et techniques utiles à un développeur (ex: %s).\n", strings.Join(labels(includes), ", "))
+	}
+	if len(excludes) > 0 {
+		prompt += fmt.Sprintf("- EXCLURE : %s.\n", strings.Join(labels(excludes), ", "))
+	}
+	prompt += "\n"
 	prompt += "Format de réponse exigé : Renvoie UNIQUEMENT un tableau JSON contenant les IDs pertinents, sans aucun autre texte. Exemple : [1, 5, 12]\n\n"
 	prompt += "Articles :\n"
 
@@ -254,7 +328,16 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 	// APPEL MISTRAL ET SAUVEGARDE EN BDD
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
 	if mistralKey != "" && len(allFetchedArticles) > 0 {
-		prompt := buildMistralPrompt(allFetchedArticles)
+		includes, err := getCriteria(db, "include")
+		if err != nil {
+			log.Println("Erreur lecture des critères (include):", err)
+		}
+		excludes, err := getCriteria(db, "exclude")
+		if err != nil {
+			log.Println("Erreur lecture des critères (exclude):", err)
+		}
+
+		prompt := buildMistralPrompt(allFetchedArticles, includes, excludes)
 
 		reqBody := MistralRequest{
 			Model:       "mistral-large-latest",
@@ -377,6 +460,27 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 // 8. SERVEUR WEB ET HTML
 // ==========================================
 
+// formatDate convertit les dates renvoyees par les APIs (formats varies)
+// en un affichage lisible : "29/07/2026 13H".
+// Si le format est inconnu, la valeur brute est renvoyee telle quelle.
+func formatDate(raw string) string {
+	layouts := []string{
+		time.RFC3339,                // 2026-07-29T13:16:30Z
+		"2006-01-02 15:04:05 -0700", // 2026-07-29 13:16:30 +0000
+		"2006-01-02T15:04:05.000Z",  // 2026-07-29T13:16:30.000Z
+		"2006-01-02 15:04:05",       // 2026-07-29 13:16:30
+		"2006-01-02T15:04:05",       // 2026-07-29T13:16:30
+		"2006-01-02",                // 2026-07-29
+	}
+
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.Format("02/01/2006 15H")
+		}
+	}
+	return raw
+}
+
 const htmlTemplate = `
 <!DOCTYPE html>
 <html lang="fr">
@@ -385,22 +489,78 @@ const htmlTemplate = `
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>The Gatherer - Veille</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; }
-        .errors-container { background: #ffebee; border-left: 5px solid #f44336; padding: 15px; margin-bottom: 30px; border-radius: 4px; }
-        .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1.1em; }
-        .error-item { margin-bottom: 8px; font-size: 0.9em; color: #333; }
+        * { box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; overflow-wrap: break-word; }
+        h1 { font-size: 1.5em; }
+
+        .errors-container { background: #ffebee; border-left: 5px solid #f44336; padding: 12px 15px; margin-bottom: 20px; border-radius: 4px; }
+        .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1em; }
+        .error-item { margin-bottom: 8px; font-size: 0.85em; }
         .error-item strong { color: #b71c1c; }
-        form { margin-bottom: 30px; background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        input[type="date"], button { padding: 8px; margin-right: 10px; border: 1px solid #ccc; border-radius: 4px; }
+
+        /* --- ONGLETS (sans JS : radios cachées + sélecteur :checked) --- */
+        .tabs { margin-bottom: 20px; }
+        .tabs > input { position: absolute; opacity: 0; pointer-events: none; }
+        .tab-bar { display: flex; gap: 4px; }
+        .tab-bar label { flex: 1; text-align: center; padding: 10px 6px; background: #e2e8f0; border-radius: 8px 8px 0 0; cursor: pointer; font-weight: bold; font-size: 0.9em; color: #555; }
+        .panel { display: none; background: white; padding: 15px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #tab-filtre:checked ~ .tab-bar label[for="tab-filtre"] { background: white; color: #0056b3; }
+        #tab-criteres:checked ~ .tab-bar label[for="tab-criteres"] { background: white; color: #0056b3; }
+        #tab-filtre:checked ~ .panel-filtre { display: block; }
+        #tab-criteres:checked ~ .panel-criteres { display: block; }
+
+        input[type="date"], input[type="text"], select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9em; max-width: 100%; }
         button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
         .reset-btn { text-decoration: none; padding: 8px 12px; background: #e0e0e0; border-radius: 4px; color: #333; font-size: 0.9em; }
-        .article { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border-left: 4px solid #0056b3; }
-        .article h2 { margin-top: 0; font-size: 1.3em; }
+
+        .filter-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 0; }
+        .field { display: flex; align-items: center; gap: 6px; }
+
+        /* --- CRITÈRES --- */
+        .hint { color: #666; font-size: 0.85em; margin: 0 0 12px 0; }
+        .criteria-cols { display: flex; flex-wrap: wrap; gap: 20px; }
+        .criteria-col { flex: 1 1 240px; min-width: 0; }
+        .criteria-col h4 { margin: 0 0 10px 0; font-size: 0.9em; }
+        .tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px 3px 10px; border-radius: 12px; margin: 0 6px 6px 0; font-size: 0.85em; }
+        .tag.include { background: #e8f5e9; color: #1b5e20; }
+        .tag.exclude { background: #ffebee; color: #b71c1c; }
+        .tag form { display: inline; margin: 0; }
+        .tag button { background: none; border: none; cursor: pointer; color: inherit; font-size: 1em; padding: 0 3px; opacity: 0.6; }
+        .tag button:hover { opacity: 1; }
+        .add-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; border-top: 1px solid #eee; padding-top: 15px; }
+        .add-form input[type="text"] { flex: 1 1 200px; min-width: 0; }
+
+        /* --- ARTICLES (compacts) --- */
+        .article { background: white; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 3px solid #0056b3; }
+        .article h2 { margin: 0 0 4px 0; font-size: 1em; line-height: 1.3; }
         .article a { color: #0056b3; text-decoration: none; }
         .article a:hover { text-decoration: underline; }
-        .meta { color: #666; font-size: 0.85em; margin-bottom: 10px; display: flex; gap: 15px; align-items: center; }
-        .source { background: #e2e8f0; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
-        .mistral-badge { background: #4caf50; color: white; padding: 2px 8px; border-radius: 4px; font-weight: bold; }
+        .meta { color: #666; font-size: 0.75em; margin-bottom: 5px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        .source { background: #e2e8f0; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
+
+        /* --- DESCRIPTION REPLIABLE --- */
+        .desc-short { margin: 0; font-size: 0.85em; line-height: 1.4; color: #444; }
+        details.desc { font-size: 0.85em; line-height: 1.4; color: #444; }
+        details.desc summary { display: block; cursor: pointer; list-style: none; }
+        details.desc summary::-webkit-details-marker { display: none; }
+        details.desc .txt { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        details.desc[open] .txt { -webkit-line-clamp: unset; overflow: visible; }
+        details.desc .more::after { content: "▾ voir plus"; color: #0056b3; font-size: 0.9em; font-weight: bold; }
+        details.desc[open] .more::after { content: "▴ voir moins"; }
+
+        /* --- MOBILE --- */
+        @media (max-width: 600px) {
+            body { margin: 15px auto; padding: 0 12px; }
+            h1 { font-size: 1.2em; }
+            .tab-bar label { font-size: 0.8em; padding: 10px 4px; }
+            .panel { padding: 12px; }
+            .filter-form .field { flex: 1 1 100%; }
+            .filter-form .field input { flex: 1; }
+            .filter-form button, .filter-form .reset-btn { flex: 1 1 100%; text-align: center; }
+            .add-form input[type="text"], .add-form select, .add-form button { flex: 1 1 100%; }
+            .criteria-cols { gap: 15px; }
+            .article { padding: 9px 12px; }
+        }
     </style>
 </head>
 <body>
@@ -417,13 +577,72 @@ const htmlTemplate = `
         {{end}}
     </div>
     {{end}}
-    
-    <form method="GET" action="/">
-        <label>Du :</label> <input type="date" name="start" value="{{.Start}}">
-        <label>Au :</label> <input type="date" name="end" value="{{.End}}">
-        <button type="submit">Filtrer</button>
-        <a href="/" class="reset-btn">Reset (24H)</a>
-    </form>
+
+    <div class="tabs">
+        <input type="radio" name="tab" id="tab-filtre" {{if not .CriteresTab}}checked{{end}}>
+        <input type="radio" name="tab" id="tab-criteres" {{if .CriteresTab}}checked{{end}}>
+
+        <div class="tab-bar">
+            <label for="tab-filtre">📅 Filtre par date</label>
+            <label for="tab-criteres">🎯 Critères de l'IA</label>
+        </div>
+
+        <!-- ONGLET 1 : FILTRE PAR DATE -->
+        <div class="panel panel-filtre">
+            <form class="filter-form" method="GET" action="/">
+                <span class="field"><label>Du :</label> <input type="date" name="start" value="{{.Start}}"></span>
+                <span class="field"><label>Au :</label> <input type="date" name="end" value="{{.End}}"></span>
+                <button type="submit">Filtrer</button>
+                <a href="/" class="reset-btn">Reset (24H)</a>
+            </form>
+        </div>
+
+        <!-- ONGLET 2 : CRITÈRES DE RECHERCHE DE L'IA -->
+        <div class="panel panel-criteres">
+            <p class="hint">Ces critères sont envoyés à l'IA lors de la prochaine récupération pour filtrer les articles.</p>
+
+            <div class="criteria-cols">
+                <div class="criteria-col">
+                    <h4>✅ Sujets recherchés</h4>
+                    {{range .Includes}}
+                    <span class="tag include">
+                        {{.Label}}
+                        <form method="POST" action="/criteres/supprimer">
+                            <input type="hidden" name="id" value="{{.ID}}">
+                            <button type="submit" title="Supprimer">✕</button>
+                        </form>
+                    </span>
+                    {{else}}
+                    <p class="hint">Aucun sujet recherché.</p>
+                    {{end}}
+                </div>
+
+                <div class="criteria-col">
+                    <h4>🚫 Sujets bloqués</h4>
+                    {{range .Excludes}}
+                    <span class="tag exclude">
+                        {{.Label}}
+                        <form method="POST" action="/criteres/supprimer">
+                            <input type="hidden" name="id" value="{{.ID}}">
+                            <button type="submit" title="Supprimer">✕</button>
+                        </form>
+                    </span>
+                    {{else}}
+                    <p class="hint">Aucun sujet bloqué.</p>
+                    {{end}}
+                </div>
+            </div>
+
+            <form class="add-form" method="POST" action="/criteres/ajouter">
+                <input type="text" name="label" placeholder="Ex: CVE, Kubernetes, Rust..." required>
+                <select name="kind">
+                    <option value="include">✅ Rechercher</option>
+                    <option value="exclude">🚫 Bloquer</option>
+                </select>
+                <button type="submit">Ajouter</button>
+            </form>
+        </div>
+    </div>
 
     <!-- LISTE ARTICLES -->
     {{if .Articles}}
@@ -432,12 +651,15 @@ const htmlTemplate = `
             <h2><a href="{{.Link}}" target="_blank">{{.Title}}</a></h2>
             <div class="meta">
                 <span class="source">{{.Source}}</span>
-                <span>📅 {{.Date}}</span>
-                {{if .MistralValid}}
-                    <span class="mistral-badge">✨ Validé par l'IA</span>
-                {{end}}
+                <span>📅 {{formatDate .Date}}</span>
             </div>
-            <p>{{.Description}}</p>
+            {{if gt (len .Description) 180}}
+            <details class="desc">
+                <summary><span class="txt">{{.Description}}</span><span class="more"></span></summary>
+            </details>
+            {{else}}
+            <p class="desc-short">{{.Description}}</p>
+            {{end}}
         </div>
         {{end}}
     {{else}}
@@ -448,11 +670,14 @@ const htmlTemplate = `
 `
 
 func handleIndex(db *sql.DB) http.HandlerFunc {
-	tmpl := template.Must(template.New("index").Parse(htmlTemplate))
+	tmpl := template.Must(template.New("index").
+		Funcs(template.FuncMap{"formatDate": formatDate}).
+		Parse(htmlTemplate))
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := r.URL.Query().Get("start")
 		end := r.URL.Query().Get("end")
+		criteresTab := r.URL.Query().Get("tab") == "criteres"
 
 		// Récupération depuis la BDD directement
 		articles, err := getArticles(db, start, end)
@@ -473,12 +698,50 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			return activeErrors[i].SourceName < activeErrors[j].SourceName
 		})
 
+		includes, err := getCriteria(db, "include")
+		if err != nil {
+			log.Println("Erreur lors de la récupération des critères (include):", err)
+		}
+		excludes, err := getCriteria(db, "exclude")
+		if err != nil {
+			log.Println("Erreur lors de la récupération des critères (exclude):", err)
+		}
+
 		tmpl.Execute(w, struct {
-			Start    string
-			End      string
-			Articles []Article
-			Errors   []APIStatus
-		}{start, end, articles, activeErrors})
+			Start       string
+			End         string
+			Articles    []Article
+			Errors      []APIStatus
+			Includes    []Criterion
+			Excludes    []Criterion
+			CriteresTab bool
+		}{start, end, articles, activeErrors, includes, excludes, criteresTab})
+	}
+}
+
+// handleAddCriterion enregistre un nouveau critère de recherche.
+func handleAddCriterion(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
+			return
+		}
+		addCriterion(db, r.FormValue("label"), r.FormValue("kind"))
+		http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
+	}
+}
+
+// handleDeleteCriterion supprime un critère de recherche.
+func handleDeleteCriterion(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
+			return
+		}
+		if id, err := strconv.Atoi(r.FormValue("id")); err == nil {
+			deleteCriterion(db, id)
+		}
+		http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
 	}
 }
 
@@ -602,6 +865,8 @@ func main() {
 	startCron(db, sources)
 
 	http.HandleFunc("/", basicAuth(handleIndex(db)))
+	http.HandleFunc("/criteres/ajouter", basicAuth(handleAddCriterion(db)))
+	http.HandleFunc("/criteres/supprimer", basicAuth(handleDeleteCriterion(db)))
 
 	port := "8080"
 	if envPort := os.Getenv("PORT"); envPort != "" {

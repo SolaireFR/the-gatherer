@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -251,7 +252,7 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
 	if mistralKey != "" && len(allFetchedArticles) > 0 {
 		prompt := buildMistralPrompt(allFetchedArticles)
-		
+
 		reqBody := MistralRequest{
 			Model:       "mistral-large-latest",
 			Temperature: 0.1,
@@ -326,25 +327,51 @@ func startCron(db *sql.DB, sources []APISource) {
 			now := time.Now()
 			// Calcul de la date de la prochaine exécution à 5h00
 			next := time.Date(now.Year(), now.Month(), now.Day(), 5, 0, 0, 0, now.Location())
-			
+
 			// Si on a déjà passé 5h00 aujourd'hui, on planifie pour demain à 5h00
 			if now.After(next) {
 				next = next.Add(24 * time.Hour)
 			}
-			
+
 			duration := next.Sub(now)
 			log.Printf("Prochaine récupération prévue dans %v (à %v)", duration, next.Format("2006-01-02 15:04:05"))
-			
+
 			// Le programme se met en pause jusqu'à l'heure cible
 			time.Sleep(duration)
-			
+
 			fetchAllSources(db, sources)
 		}
 	}()
 }
 
 // ==========================================
-// 7. SERVEUR WEB ET HTML
+// 7. PROTECTION PAR MOT DE PASSE GLOBAL
+// ==========================================
+
+// basicAuth bloque tout l'accès au site tant que le bon mot de passe
+// (variable d'environnement SITE_PASSWORD) n'a pas été fourni.
+// Si la variable est vide, le site reste ouvert.
+func basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	password := os.Getenv("SITE_PASSWORD")
+
+	if password == "" {
+		log.Println("⚠️  SITE_PASSWORD non défini : le site est accessible sans mot de passe.")
+		return next
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, pass, ok := r.BasicAuth()
+		if !ok || subtle.ConstantTimeCompare([]byte(pass), []byte(password)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="The Gatherer"`)
+			http.Error(w, "Accès refusé", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ==========================================
+// 8. SERVEUR WEB ET HTML
 // ==========================================
 
 const htmlTemplate = `
@@ -453,7 +480,7 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 }
 
 // ==========================================
-// 8. MAIN & CONFIGURATION DES APIs
+// 9. MAIN & CONFIGURATION DES APIs
 // ==========================================
 
 func main() {
@@ -571,7 +598,7 @@ func main() {
 
 	startCron(db, sources)
 
-	http.HandleFunc("/", handleIndex(db))
+	http.HandleFunc("/", basicAuth(handleIndex(db)))
 
 	port := "8080"
 	if envPort := os.Getenv("PORT"); envPort != "" {

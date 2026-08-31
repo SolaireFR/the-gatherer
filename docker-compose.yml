@@ -12,4 +12,5 @@ services:
       - GNEWS_API_KEY=${GNEWS_API_KEY}
       - CURRENTS_API_KEY=${CURRENTS_API_KEY}
       - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - SITE_PASSWORD=${SITE_PASSWORD}
     restart: unless-stopped

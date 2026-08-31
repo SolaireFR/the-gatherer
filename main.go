@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // ==========================================
@@ -71,7 +71,7 @@ func setAPIStatus(name string, errMsg string) {
 // ==========================================
 
 func initDB(filepath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", filepath)
+	db, err := sql.Open("sqlite", filepath)
 	if err != nil {
 		return nil, err
 	}
@@ -146,6 +146,9 @@ func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
 			a.MistralValid = true // S'il est en BDD, c'est qu'il a été validé par l'IA
 			articles = append(articles, a)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return articles, nil
 }

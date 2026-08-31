@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +31,7 @@ type Article struct {
 	Date         string
 	Link         string
 	Source       string
+	Categories   []string
 	MistralValid bool
 }
 
@@ -48,6 +48,15 @@ type APIStatus struct {
 	LastCheck  string
 }
 
+// LogEntry : un problème rencontré lors d'une récupération, consultable
+// depuis l'onglet Journal.
+type LogEntry struct {
+	ID        int
+	CreatedAt string
+	Context   string
+	Message   string
+}
+
 // Criterion : un critère de recherche modifiable depuis le site.
 // Kind vaut "include" (sujet recherché) ou "exclude" (sujet bloqué).
 type Criterion struct {
@@ -57,7 +66,34 @@ type Criterion struct {
 }
 
 // ==========================================
-// 2. GESTION DE L'ÉTAT ET DES ERREURS
+// 2. CONFIGURATION (VARIABLES D'ENVIRONNEMENT)
+// ==========================================
+
+// getEnv renvoie la variable d'environnement, ou la valeur par défaut si elle
+// est absente ou vide.
+func getEnv(key string, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvFloat comme getEnv, pour un nombre décimal.
+func getEnvFloat(key string, defaultValue float64) float64 {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return defaultValue
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Printf("%s = %q n'est pas un nombre valide, valeur par défaut utilisée (%v)", key, raw, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+// ==========================================
+// 3. GESTION DE L'ÉTAT ET DES ERREURS
 // ==========================================
 
 var (
@@ -76,7 +112,7 @@ func setAPIStatus(name string, errMsg string) {
 }
 
 // ==========================================
-// 3. BASE DE DONNÉES
+// 4. BASE DE DONNÉES
 // ==========================================
 
 func initDB(filepath string) (*sql.DB, error) {
@@ -101,6 +137,7 @@ func initDB(filepath string) (*sql.DB, error) {
 	// Mises à jour du schéma (ignorées si elles existent déjà)
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN source TEXT DEFAULT 'Inconnue'`)
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`)
+	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN categories TEXT DEFAULT ''`)
 
 	// Table des critères de recherche envoyés à l'IA
 	criteriaQuery := `
@@ -115,7 +152,71 @@ func initDB(filepath string) (*sql.DB, error) {
 		return nil, err
 	}
 
+	// Journal des problèmes (réponses Mistral invalides, etc.)
+	logQuery := `
+	CREATE TABLE IF NOT EXISTS logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at DATETIME,
+		context TEXT,
+		message TEXT
+	);`
+
+	if _, err = db.Exec(logQuery); err != nil {
+		return nil, err
+	}
+
 	return db, nil
+}
+
+// logProblem écrit un problème dans la console ET dans le journal en base.
+func logProblem(db *sql.DB, context string, format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+
+	// Les réponses d'API peuvent être très longues : on tronque pour garder
+	// un journal lisible.
+	if len(message) > 1000 {
+		message = message[:1000] + "... (tronqué)"
+	}
+
+	log.Printf("[%s] %s", context, message)
+
+	_, err := db.Exec(`INSERT INTO logs (created_at, context, message) VALUES (?, ?, ?)`,
+		time.Now().Format("2006-01-02 15:04:05"), context, message)
+	if err != nil {
+		log.Println("Erreur écriture du journal:", err)
+	}
+}
+
+// getLogs renvoie les derniers problèmes enregistrés, du plus récent au plus ancien.
+func getLogs(db *sql.DB, limit int) ([]LogEntry, error) {
+	rows, err := db.Query(`SELECT id, created_at, context, message FROM logs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []LogEntry
+	for rows.Next() {
+		var e LogEntry
+		if err := rows.Scan(&e.ID, &e.CreatedAt, &e.Context, &e.Message); err == nil {
+			entries = append(entries, e)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// splitCategories transforme "Go,Docker" en []string{"Go", "Docker"}.
+func splitCategories(raw string) []string {
+	var cats []string
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			cats = append(cats, c)
+		}
+	}
+	return cats
 }
 
 // getCriteria renvoie tous les critères d'un type donné ("include" ou "exclude").
@@ -157,7 +258,7 @@ func deleteCriterion(db *sql.DB, id int) {
 }
 
 func saveArticles(db *sql.DB, articles []Article) {
-	query := `INSERT OR IGNORE INTO articles (title, description, date, link, source) VALUES (?, ?, ?, ?, ?)`
+	query := `INSERT OR IGNORE INTO articles (title, description, date, link, source, categories) VALUES (?, ?, ?, ?, ?, ?)`
 	stmt, err := db.Prepare(query)
 	if err != nil {
 		log.Println("Erreur préparation DB:", err)
@@ -166,7 +267,7 @@ func saveArticles(db *sql.DB, articles []Article) {
 	defer stmt.Close()
 
 	for _, a := range articles {
-		_, err := stmt.Exec(a.Title, a.Description, a.Date, a.Link, a.Source)
+		_, err := stmt.Exec(a.Title, a.Description, a.Date, a.Link, a.Source, strings.Join(a.Categories, ","))
 		if err != nil {
 			log.Println("Erreur insertion article:", err)
 		}
@@ -174,8 +275,8 @@ func saveArticles(db *sql.DB, articles []Article) {
 }
 
 // Récupère les articles de la BDD (Dernières 24H par défaut ou selon les filtres)
-func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
-	query := `SELECT id, title, description, date, link, source FROM articles WHERE 1=1`
+func getArticles(db *sql.DB, start string, end string, cats []string) ([]Article, error) {
+	query := `SELECT id, title, description, date, link, source, COALESCE(categories, '') FROM articles WHERE 1=1`
 	var args []interface{}
 
 	if start != "" {
@@ -191,6 +292,18 @@ func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
 		args = append(args, end+" 23:59:59")
 	}
 
+	// Filtre par categories : l'article est garde s'il porte AU MOINS une
+	// des categories cochees. Les virgules encadrantes evitent qu'une
+	// categorie soit trouvee a l'interieur du nom d'une autre.
+	if len(cats) > 0 {
+		var conditions []string
+		for _, c := range cats {
+			conditions = append(conditions, `',' || COALESCE(categories, '') || ',' LIKE ?`)
+			args = append(args, "%,"+c+",%")
+		}
+		query += ` AND (` + strings.Join(conditions, " OR ") + `)`
+	}
+
 	query += ` ORDER BY created_at DESC`
 
 	rows, err := db.Query(query, args...)
@@ -202,7 +315,9 @@ func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
 	var articles []Article
 	for rows.Next() {
 		var a Article
-		if err := rows.Scan(&a.ID, &a.Title, &a.Description, &a.Date, &a.Link, &a.Source); err == nil {
+		var rawCats string
+		if err := rows.Scan(&a.ID, &a.Title, &a.Description, &a.Date, &a.Link, &a.Source, &rawCats); err == nil {
+			a.Categories = splitCategories(rawCats)
 			a.MistralValid = true // S'il est en BDD, c'est qu'il a été validé par l'IA
 			articles = append(articles, a)
 		}
@@ -214,7 +329,7 @@ func getArticles(db *sql.DB, start string, end string) ([]Article, error) {
 }
 
 // ==========================================
-// 4. PREPARATION API MISTRAL
+// 5. PREPARATION API MISTRAL
 // ==========================================
 
 type MistralMessage struct {
@@ -226,6 +341,39 @@ type MistralRequest struct {
 	Model       string           `json:"model"`
 	Messages    []MistralMessage `json:"messages"`
 	Temperature float64          `json:"temperature,omitempty"`
+}
+
+// parseMistralSelection extrait du texte renvoyé par l'IA les articles retenus
+// et leurs catégories. L'IA encadre parfois sa réponse de texte ou de balises
+// Markdown, on isole donc le tableau JSON entre le premier [ et le dernier ].
+func parseMistralSelection(content string) (map[int][]string, error) {
+	selected := make(map[int][]string)
+
+	first := strings.Index(content, "[")
+	last := strings.LastIndex(content, "]")
+	if first == -1 || last == -1 || last < first {
+		return selected, fmt.Errorf("aucun tableau JSON trouvé dans la réponse : %s", content)
+	}
+
+	var items []struct {
+		ID         int      `json:"id"`
+		Categories []string `json:"categories"`
+	}
+	if err := json.Unmarshal([]byte(content[first:last+1]), &items); err != nil {
+		return selected, fmt.Errorf("JSON invalide (%v) : %s", err, content)
+	}
+
+	for _, item := range items {
+		var cats []string
+		for _, c := range item.Categories {
+			// La virgule est le séparateur en base : on la retire des libellés.
+			if c = strings.TrimSpace(strings.ReplaceAll(c, ",", " ")); c != "" {
+				cats = append(cats, c)
+			}
+		}
+		selected[item.ID] = cats
+	}
+	return selected, nil
 }
 
 // labels extrait les libellés d'une liste de critères.
@@ -242,31 +390,28 @@ func buildMistralPrompt(articles []Article, includes []Criterion, excludes []Cri
 	prompt += "Voici une liste d'articles avec leur ID.\n\n"
 	prompt += "RÈGLES DE SÉLECTION :\n"
 	if len(includes) > 0 {
-		prompt += fmt.Sprintf("- INCLURE : Articles 100%% concrets et techniques utiles à un développeur (ex: %s).\n", strings.Join(labels(includes), ", "))
+		prompt += fmt.Sprintf("- INCLURE : Articles 100%% concrets et techniques utiles à un développeur, correspondant à au moins une de ces catégories : %s.\n", strings.Join(labels(includes), ", "))
 	}
 	if len(excludes) > 0 {
 		prompt += fmt.Sprintf("- EXCLURE : %s.\n", strings.Join(labels(excludes), ", "))
 	}
 	prompt += "\n"
-	prompt += "Format de réponse exigé : Renvoie UNIQUEMENT un tableau JSON contenant les IDs pertinents, sans aucun autre texte. Exemple : [1, 5, 12]\n\n"
+	if len(includes) > 0 {
+		prompt += "Pour chaque article retenu, attribue 1 a 3 categories prises STRICTEMENT dans la liste ci-dessus, en respectant l'orthographe exacte.\n"
+	}
+	prompt += "Format de reponse exige : Renvoie UNIQUEMENT un tableau JSON, sans aucun autre texte.\n"
+	prompt += "Chaque element contient l'id de l'article et ses categories.\n"
+	prompt += "Exemple : [{\"id\": 1, \"categories\": [\"Backend\", \"DevOps\"]}, {\"id\": 5, \"categories\": [\"Securite\"]}]\n\n"
 	prompt += "Articles :\n"
 
 	for _, a := range articles {
-		title := a.Title
-		if len(title) > 100 {
-			title = title[:100] + "..."
-		}
-		desc := a.Description
-		if len(desc) > 150 {
-			desc = desc[:150] + "..."
-		}
-		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, title, desc)
+		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, a.Title, a.Description)
 	}
 	return prompt
 }
 
 // ==========================================
-// 5. FETCH API GENERIQUE ET APPEL MISTRAL
+// 6. FETCH API GENERIQUE ET APPEL MISTRAL
 // ==========================================
 
 func fetchAllSources(db *sql.DB, sources []APISource) {
@@ -340,15 +485,15 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		prompt := buildMistralPrompt(allFetchedArticles, includes, excludes)
 
 		reqBody := MistralRequest{
-			Model:       "mistral-large-latest",
-			Temperature: 0.1,
+			Model:       getEnv("MISTRAL_MODEL", "mistral-small-latest"),
+			Temperature: getEnvFloat("MISTRAL_TEMPERATURE", 0.1),
 			Messages: []MistralMessage{
 				{Role: "user", Content: prompt},
 			},
 		}
 		jsonBody, _ := json.Marshal(reqBody)
 
-		req, _ := http.NewRequest("POST", "https://api.mistral.ai/v1/chat/completions", bytes.NewBuffer(jsonBody))
+		req, _ := http.NewRequest("POST", getEnv("MISTRAL_API_URL", "https://api.mistral.ai/v1/chat/completions"), bytes.NewBuffer(jsonBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+mistralKey)
 
@@ -356,12 +501,22 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		resp, err := mistralClient.Do(req)
 
 		if err != nil {
-			log.Println("Erreur HTTP Mistral:", err)
+			logProblem(db, "Appel Mistral", "Erreur réseau : %v", err)
 			return
 		}
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+
+		if readErr != nil {
+			logProblem(db, "Appel Mistral", "Lecture de la réponse impossible : %v", readErr)
+			return
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			logProblem(db, "Appel Mistral", "Code HTTP %d - Réponse : %s", resp.StatusCode, string(bodyBytes))
+			return
+		}
 
 		var mistralResp struct {
 			Choices []struct {
@@ -370,38 +525,96 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 				} `json:"message"`
 			} `json:"choices"`
 		}
-		json.Unmarshal(bodyBytes, &mistralResp)
-
-		if len(mistralResp.Choices) > 0 {
-			content := mistralResp.Choices[0].Message.Content
-			re := regexp.MustCompile(`\d+`)
-			matches := re.FindAllString(content, -1)
-
-			validIDs := make(map[int]bool)
-			for _, m := range matches {
-				if id, err := strconv.Atoi(m); err == nil {
-					validIDs[id] = true
-				}
-			}
-
-			// On isole uniquement les articles validés par l'IA
-			var validArticles []Article
-			for i := range allFetchedArticles {
-				if validIDs[allFetchedArticles[i].ID] {
-					allFetchedArticles[i].MistralValid = true
-					validArticles = append(validArticles, allFetchedArticles[i])
-				}
-			}
-
-			// SAUVEGARDE EN BDD : Uniquement les articles validés !
-			saveArticles(db, validArticles)
-			log.Printf("✅ %d articles validés par Mistral ont été sauvegardés en BDD.", len(validArticles))
+		if err := json.Unmarshal(bodyBytes, &mistralResp); err != nil {
+			logProblem(db, "Réponse Mistral", "Réponse illisible (%v) : %s", err, string(bodyBytes))
+			return
 		}
+
+		if len(mistralResp.Choices) == 0 {
+			logProblem(db, "Réponse Mistral", "Aucune réponse renvoyée par l'IA : %s", string(bodyBytes))
+			return
+		}
+
+		content := mistralResp.Choices[0].Message.Content
+		if strings.TrimSpace(content) == "" {
+			logProblem(db, "Réponse Mistral", "L'IA a renvoyé une réponse vide.")
+			return
+		}
+
+		selected, err := parseMistralSelection(content)
+		if err != nil {
+			logProblem(db, "Réponse Mistral", "%v", err)
+			return
+		}
+
+		if len(selected) == 0 {
+			logProblem(db, "Réponse Mistral", "L'IA n'a retenu aucun article sur les %d proposés. Réponse : %s", len(allFetchedArticles), content)
+			return
+		}
+
+		// Vérification du contenu : les IDs et catégories doivent exister.
+		knownIDs := make(map[int]bool)
+		for _, a := range allFetchedArticles {
+			knownIDs[a.ID] = true
+		}
+		knownCats := make(map[string]bool)
+		for _, c := range includes {
+			knownCats[c.Label] = true
+		}
+
+		var unknownIDs []string
+		for id := range selected {
+			if !knownIDs[id] {
+				unknownIDs = append(unknownIDs, strconv.Itoa(id))
+			}
+		}
+		if len(unknownIDs) > 0 {
+			sort.Strings(unknownIDs)
+			logProblem(db, "Réponse Mistral", "%d ID(s) inconnu(s) ignoré(s) : %s", len(unknownIDs), strings.Join(unknownIDs, ", "))
+		}
+
+		// On isole uniquement les articles validés par l'IA
+		var validArticles []Article
+		unknownCats := make(map[string]bool)
+		for i := range allFetchedArticles {
+			cats, ok := selected[allFetchedArticles[i].ID]
+			if !ok {
+				continue
+			}
+
+			// Seules les catégories connues sont conservées, sinon le filtre
+			// du site ne pourrait pas les proposer.
+			var validCats []string
+			for _, c := range cats {
+				if knownCats[c] {
+					validCats = append(validCats, c)
+				} else {
+					unknownCats[c] = true
+				}
+			}
+
+			allFetchedArticles[i].MistralValid = true
+			allFetchedArticles[i].Categories = validCats
+			validArticles = append(validArticles, allFetchedArticles[i])
+		}
+
+		if len(unknownCats) > 0 {
+			var list []string
+			for c := range unknownCats {
+				list = append(list, c)
+			}
+			sort.Strings(list)
+			logProblem(db, "Réponse Mistral", "Catégorie(s) hors liste ignorée(s) : %s", strings.Join(list, ", "))
+		}
+
+		// SAUVEGARDE EN BDD : Uniquement les articles validés !
+		saveArticles(db, validArticles)
+		log.Printf("✅ %d articles validés par Mistral ont été sauvegardés en BDD.", len(validArticles))
 	}
 }
 
 // ==========================================
-// 6. CRON (TICKER INTELLIGENT)
+// 7. CRON (TICKER INTELLIGENT)
 // ==========================================
 
 func startCron(db *sql.DB, sources []APISource) {
@@ -431,7 +644,7 @@ func startCron(db *sql.DB, sources []APISource) {
 }
 
 // ==========================================
-// 7. PROTECTION PAR MOT DE PASSE GLOBAL
+// 8. PROTECTION PAR MOT DE PASSE GLOBAL
 // ==========================================
 
 // basicAuth bloque tout l'accès au site tant que le bon mot de passe
@@ -457,7 +670,7 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ==========================================
-// 8. SERVEUR WEB ET HTML
+// 9. SERVEUR WEB ET HTML
 // ==========================================
 
 // formatDate convertit les dates renvoyees par les APIs (formats varies)
@@ -476,6 +689,17 @@ func formatDate(raw string) string {
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, raw); err == nil {
 			return t.Format("02/01/2006 15H")
+		}
+	}
+	return raw
+}
+
+// formatDateTime affiche une date du journal avec l'heure precise : "31/08/2026 13:25".
+// Le driver SQLite peut renvoyer la date au format RFC3339, on gere les deux.
+func formatDateTime(raw string) string {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05"} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.Format("02/01/2006 15:04")
 		}
 	}
 	return raw
@@ -506,8 +730,18 @@ const htmlTemplate = `
         .panel { display: none; background: white; padding: 15px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         #tab-filtre:checked ~ .tab-bar label[for="tab-filtre"] { background: white; color: #0056b3; }
         #tab-criteres:checked ~ .tab-bar label[for="tab-criteres"] { background: white; color: #0056b3; }
+        #tab-logs:checked ~ .tab-bar label[for="tab-logs"] { background: white; color: #0056b3; }
         #tab-filtre:checked ~ .panel-filtre { display: block; }
         #tab-criteres:checked ~ .panel-criteres { display: block; }
+        #tab-logs:checked ~ .panel-logs { display: block; }
+        .tab-bar .badge { background: #d32f2f; color: white; border-radius: 9px; padding: 0 6px; font-size: 0.8em; margin-left: 4px; }
+
+        /* --- JOURNAL --- */
+        .log-list { display: flex; flex-direction: column; gap: 8px; }
+        .log-item { border-left: 3px solid #f44336; background: #fdf6f6; border-radius: 4px; padding: 8px 12px; }
+        .log-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.75em; color: #666; margin-bottom: 4px; }
+        .log-context { background: #ffebee; color: #b71c1c; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
+        .log-msg { margin: 0; font-size: 0.85em; line-height: 1.4; color: #444; font-family: Consolas, monospace; word-break: break-word; }
 
         input[type="date"], input[type="text"], select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9em; max-width: 100%; }
         button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
@@ -515,6 +749,21 @@ const htmlTemplate = `
 
         .filter-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 0; }
         .field { display: flex; align-items: center; gap: 6px; }
+
+        /* --- SELECT A CASES A COCHER (sans JS) --- */
+        .cat-select { position: relative; }
+        .cat-select > summary { list-style: none; cursor: pointer; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; background: white; font-size: 0.9em; white-space: nowrap; }
+        .cat-select > summary::-webkit-details-marker { display: none; }
+        .cat-select > summary::after { content: " \25BE"; }
+        .cat-select[open] > summary { border-color: #0056b3; color: #0056b3; }
+        .cat-menu { position: absolute; z-index: 10; top: 100%; left: 0; margin-top: 4px; background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); padding: 8px; min-width: 220px; max-height: 260px; overflow-y: auto; }
+        .cat-menu label { display: flex; align-items: center; gap: 8px; padding: 5px 4px; font-size: 0.9em; cursor: pointer; border-radius: 3px; }
+        .cat-menu label:hover { background: #f4f4f9; }
+        .cat-menu input { margin: 0; }
+        .cat-empty { color: #666; font-size: 0.85em; margin: 0; padding: 4px; }
+
+        /* --- CHIPS DE CATEGORIE SUR LES ARTICLES --- */
+        .cat-chip { background: #ede7f6; color: #4527a0; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
 
         /* --- CRITÈRES --- */
         .hint { color: #666; font-size: 0.85em; margin: 0 0 12px 0; }
@@ -581,10 +830,12 @@ const htmlTemplate = `
     <div class="tabs">
         <input type="radio" name="tab" id="tab-filtre" {{if not .CriteresTab}}checked{{end}}>
         <input type="radio" name="tab" id="tab-criteres" {{if .CriteresTab}}checked{{end}}>
+        <input type="radio" name="tab" id="tab-logs" {{if .LogsTab}}checked{{end}}>
 
         <div class="tab-bar">
-            <label for="tab-filtre">📅 Filtre par date</label>
+            <label for="tab-filtre">📅 Filtre</label>
             <label for="tab-criteres">🎯 Critères de l'IA</label>
+            <label for="tab-logs">⚠️ Journal{{if .Logs}}<span class="badge">{{len .Logs}}</span>{{end}}</label>
         </div>
 
         <!-- ONGLET 1 : FILTRE PAR DATE -->
@@ -592,6 +843,21 @@ const htmlTemplate = `
             <form class="filter-form" method="GET" action="/">
                 <span class="field"><label>Du :</label> <input type="date" name="start" value="{{.Start}}"></span>
                 <span class="field"><label>Au :</label> <input type="date" name="end" value="{{.End}}"></span>
+
+                <details class="cat-select">
+                    <summary>{{if .NbSelected}}{{.NbSelected}} categorie(s){{else}}Toutes les categories{{end}}</summary>
+                    <div class="cat-menu">
+                        {{range .Categories}}
+                        <label>
+                            <input type="checkbox" name="cat" value="{{.Name}}" {{if .Checked}}checked{{end}}>
+                            {{.Name}}
+                        </label>
+                        {{else}}
+                        <p class="cat-empty">Aucune categorie pour l'instant.</p>
+                        {{end}}
+                    </div>
+                </details>
+
                 <button type="submit">Filtrer</button>
                 <a href="/" class="reset-btn">Reset (24H)</a>
             </form>
@@ -599,11 +865,11 @@ const htmlTemplate = `
 
         <!-- ONGLET 2 : CRITÈRES DE RECHERCHE DE L'IA -->
         <div class="panel panel-criteres">
-            <p class="hint">Ces critères sont envoyés à l'IA lors de la prochaine récupération pour filtrer les articles.</p>
+            <p class="hint">Ces critères sont envoyés à l'IA lors de la prochaine récupération. Les sujets recherchés servent aussi de catégories pour classer les articles et alimentent le filtre par catégorie.</p>
 
             <div class="criteria-cols">
                 <div class="criteria-col">
-                    <h4>✅ Sujets recherchés</h4>
+                    <h4>✅ Sujets recherchés (= catégories)</h4>
                     {{range .Includes}}
                     <span class="tag include">
                         {{.Label}}
@@ -642,6 +908,27 @@ const htmlTemplate = `
                 <button type="submit">Ajouter</button>
             </form>
         </div>
+
+        <!-- ONGLET 3 : JOURNAL DES PROBLEMES -->
+        <div class="panel panel-logs">
+            <p class="hint">Problèmes rencontrés lors des récupérations (réponses de l'IA invalides, erreurs réseau...). Les 50 plus récents sont affichés.</p>
+
+            {{if .Logs}}
+            <div class="log-list">
+                {{range .Logs}}
+                <div class="log-item">
+                    <div class="log-head">
+                        <span class="log-context">{{.Context}}</span>
+                        <span>{{formatDateTime .CreatedAt}}</span>
+                    </div>
+                    <p class="log-msg">{{.Message}}</p>
+                </div>
+                {{end}}
+            </div>
+            {{else}}
+            <p class="hint">Aucun problème enregistré.</p>
+            {{end}}
+        </div>
     </div>
 
     <!-- LISTE ARTICLES -->
@@ -652,6 +939,9 @@ const htmlTemplate = `
             <div class="meta">
                 <span class="source">{{.Source}}</span>
                 <span>📅 {{formatDate .Date}}</span>
+                {{range .Categories}}
+                    <span class="cat-chip">{{.}}</span>
+                {{end}}
             </div>
             {{if gt (len .Description) 180}}
             <details class="desc">
@@ -671,16 +961,18 @@ const htmlTemplate = `
 
 func handleIndex(db *sql.DB) http.HandlerFunc {
 	tmpl := template.Must(template.New("index").
-		Funcs(template.FuncMap{"formatDate": formatDate}).
+		Funcs(template.FuncMap{"formatDate": formatDate, "formatDateTime": formatDateTime}).
 		Parse(htmlTemplate))
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := r.URL.Query().Get("start")
 		end := r.URL.Query().Get("end")
 		criteresTab := r.URL.Query().Get("tab") == "criteres"
+		logsTab := r.URL.Query().Get("tab") == "logs"
+		selectedCats := r.URL.Query()["cat"]
 
 		// Récupération depuis la BDD directement
-		articles, err := getArticles(db, start, end)
+		articles, err := getArticles(db, start, end, selectedCats)
 		if err != nil {
 			log.Println("Erreur lors de la récupération des articles BDD:", err)
 		}
@@ -707,6 +999,29 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			log.Println("Erreur lors de la récupération des critères (exclude):", err)
 		}
 
+		// Les critères recherchés servent aussi de catégories : les cases à
+		// cocher du filtre reprennent donc exactement cette liste.
+		type CategoryChoice struct {
+			Name    string
+			Checked bool
+		}
+		var catChoices []CategoryChoice
+		for _, c := range labels(includes) {
+			checked := false
+			for _, sel := range selectedCats {
+				if sel == c {
+					checked = true
+					break
+				}
+			}
+			catChoices = append(catChoices, CategoryChoice{c, checked})
+		}
+
+		logs, err := getLogs(db, 50)
+		if err != nil {
+			log.Println("Erreur lors de la récupération du journal:", err)
+		}
+
 		tmpl.Execute(w, struct {
 			Start       string
 			End         string
@@ -715,7 +1030,11 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			Includes    []Criterion
 			Excludes    []Criterion
 			CriteresTab bool
-		}{start, end, articles, activeErrors, includes, excludes, criteresTab})
+			LogsTab     bool
+			Categories  []CategoryChoice
+			NbSelected  int
+			Logs        []LogEntry
+		}{start, end, articles, activeErrors, includes, excludes, criteresTab, logsTab, catChoices, len(selectedCats), logs})
 	}
 }
 
@@ -746,7 +1065,7 @@ func handleDeleteCriterion(db *sql.DB) http.HandlerFunc {
 }
 
 // ==========================================
-// 9. MAIN & CONFIGURATION DES APIs
+// 10. MAIN & CONFIGURATION DES APIs
 // ==========================================
 
 func main() {
@@ -764,7 +1083,7 @@ func main() {
 	sources := []APISource{
 		{
 			Name: "Dev.to",
-			URL:  "https://dev.to/api/articles?tag=programming&per_page=15",
+			URL:  getEnv("DEVTO_API_URL", "https://dev.to/api/articles?tag=programming&per_page=15"),
 			Parse: func(body []byte) ([]Article, error) {
 				var devTo []struct {
 					Title       string `json:"title"`
@@ -787,7 +1106,7 @@ func main() {
 	if currentsKey != "" {
 		sources = append(sources, APISource{
 			Name: "CurrentsAPI",
-			URL:  "https://api.currentsapi.services/v1/latest-news?language=en&category=technology",
+			URL:  getEnv("CURRENTS_API_URL", "https://api.currentsapi.services/v1/latest-news?language=en&category=technology"),
 			Headers: map[string]string{
 				"Authorization": currentsKey,
 			},
@@ -815,7 +1134,7 @@ func main() {
 	if gnewsKey != "" {
 		sources = append(sources, APISource{
 			Name: "GNews",
-			URL:  fmt.Sprintf("https://gnews.io/api/v4/top-headlines?category=technology&lang=en&apikey=%s", gnewsKey),
+			URL:  getEnv("GNEWS_API_URL", "https://gnews.io/api/v4/top-headlines?category=technology&lang=en") + "&apikey=" + gnewsKey,
 			Parse: func(body []byte) ([]Article, error) {
 				var res struct {
 					Articles []struct {
@@ -840,7 +1159,7 @@ func main() {
 	if newsapiKey != "" {
 		sources = append(sources, APISource{
 			Name: "NewsAPI",
-			URL:  fmt.Sprintf("https://newsapi.org/v2/top-headlines?category=technology&apiKey=%s", newsapiKey),
+			URL:  getEnv("NEWSAPI_API_URL", "https://newsapi.org/v2/top-headlines?category=technology") + "&apiKey=" + newsapiKey,
 			Parse: func(body []byte) ([]Article, error) {
 				var res struct {
 					Articles []struct {

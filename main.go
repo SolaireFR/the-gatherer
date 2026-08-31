@@ -711,7 +711,7 @@ const htmlTemplate = `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The Gatherer - Veille</title>
+    <title>The Gatherer (Veille info-tech)</title>
     <style>
         * { box-sizing: border-box; }
         body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; overflow-wrap: break-word; }

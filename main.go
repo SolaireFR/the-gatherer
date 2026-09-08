@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -283,6 +284,60 @@ func rateLimitHeaders(h http.Header) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, " | ")
+}
+
+// dateLayouts : formats de date renvoyes par les differentes APIs.
+var dateLayouts = []string{
+	time.RFC3339,                // 2026-07-29T13:16:30Z
+	"2006-01-02 15:04:05 -0700", // 2026-07-29 13:16:30 +0000
+	"2006-01-02T15:04:05.000Z",  // 2026-07-29T13:16:30.000Z
+	"2006-01-02 15:04:05",       // 2026-07-29 13:16:30
+	"2006-01-02T15:04:05",       // 2026-07-29T13:16:30
+	"2006-01-02",                // 2026-07-29
+}
+
+// dayKey extrait le jour d'une date brute ("2026-07-29"). Les dates sont
+// stockees telles que les APIs les renvoient : si le format est inconnu, on
+// retombe sur les 10 premiers caracteres, qui suffisent pour les formats ISO.
+func dayKey(raw string) string {
+	for _, layout := range dateLayouts {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	if len(raw) >= 10 {
+		return raw[:10]
+	}
+	return raw
+}
+
+// articleKey identifie un article par son titre et son jour de publication.
+// La casse et les espaces sont normalises pour que deux sources qui titrent
+// pareil ne passent pas deux fois.
+func articleKey(title string, date string) string {
+	return dayKey(date) + "|" + strings.ToLower(strings.Join(strings.Fields(title), " "))
+}
+
+// getProcessedKeys renvoie les articles deja traites, sous forme de couples
+// titre + jour. Ils ne sont ni renvoyes a l'IA ni reenregistres.
+func getProcessedKeys(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT title, date FROM articles`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	keys := make(map[string]bool)
+	for rows.Next() {
+		var title, date string
+		if err := rows.Scan(&title, &date); err == nil {
+			keys[articleKey(title, date)] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 // splitCategories transforme "Go,Docker" en []string{"Go", "Docker"}.
@@ -602,7 +657,29 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		setAPIStatus(source.Name, "")
 	}
 
-	log.Printf("Total de %d articles bruts récupérés. Envoi à Mistral...", len(allFetchedArticles))
+	// FILTRE DES ARTICLES DEJA TRAITES : un meme titre publie le meme jour a
+	// deja ete soumis a l'IA, inutile de le repayer ni de le redemander.
+	processed, err := getProcessedKeys(db)
+	if err != nil {
+		log.Println("Erreur lecture des articles déjà traités:", err)
+		processed = make(map[string]bool)
+	}
+
+	seen := make(map[string]bool)
+	var freshArticles []Article
+	for _, a := range allFetchedArticles {
+		key := articleKey(a.Title, a.Date)
+		if processed[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		freshArticles = append(freshArticles, a)
+	}
+
+	skipped := len(allFetchedArticles) - len(freshArticles)
+	allFetchedArticles = freshArticles
+
+	log.Printf("Total de %d articles bruts récupérés (%d déjà traités ignorés). Envoi à Mistral...", len(allFetchedArticles), skipped)
 
 	// APPEL MISTRAL ET SAUVEGARDE EN BDD
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
@@ -793,6 +870,224 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // ==========================================
+// 8 bis. FILTRE PAR PLAGE DE DATES
+// ==========================================
+
+// isoDay : format des bornes echangees avec les champs <input type="date">.
+const isoDay = "2006-01-02"
+
+// DateRange : une plage [Start, End] en ISO court, bornes eventuellement vides.
+type DateRange struct {
+	Start string
+	End   string
+}
+
+// PresetLink : un prereglage de periode (Jour, Semaine...) propose dans le
+// menu du filtre. L'URL porte deja la plage calculee, aucun JS n'est requis.
+type PresetLink struct {
+	Label  string
+	URL    string
+	Active bool
+}
+
+// DateFilter : tout ce dont le gabarit a besoin pour afficher la pastille de
+// filtre par periode : libelle courant, prereglages et fleches de decalage.
+type DateFilter struct {
+	Start    string
+	End      string
+	Active   bool
+	Label    string
+	Presets  []PresetLink
+	PrevURL  string
+	NextURL  string
+	ResetURL string
+}
+
+// presetKeys : les prereglages proposes, dans l'ordre d'affichage.
+var presetKeys = []struct {
+	Key   string
+	Label string
+}{
+	{"day", "Jour"},
+	{"week", "Semaine"},
+	{"month", "Mois"},
+	{"quarter", "Trimestre"},
+	{"year", "Année"},
+}
+
+// endOfMonth renvoie le dernier jour du mois de d (le "jour 0" du mois suivant).
+func endOfMonth(d time.Time) time.Time {
+	return time.Date(d.Year(), d.Month()+1, 0, 0, 0, 0, 0, d.Location())
+}
+
+// computePresetRange calcule la plage d'un prereglage, relative a now.
+// La semaine va du lundi au dimanche ; mois, trimestre et annee sont civils.
+func computePresetRange(key string, now time.Time) DateRange {
+	y, m, d := now.Date()
+	loc := now.Location()
+	day := func(t time.Time) string { return t.Format(isoDay) }
+
+	switch key {
+	case "day":
+		return DateRange{day(now), day(now)}
+	case "week":
+		// Weekday() renvoie 0 = dimanche : on ramene lundi en tete.
+		dow := (int(now.Weekday()) + 6) % 7
+		monday := time.Date(y, m, d-dow, 0, 0, 0, 0, loc)
+		return DateRange{day(monday), day(monday.AddDate(0, 0, 6))}
+	case "month":
+		first := time.Date(y, m, 1, 0, 0, 0, 0, loc)
+		return DateRange{day(first), day(endOfMonth(first))}
+	case "quarter":
+		first := time.Date(y, (m-1)/3*3+1, 1, 0, 0, 0, 0, loc)
+		return DateRange{day(first), day(first.AddDate(0, 3, 0).AddDate(0, 0, -1))}
+	case "year":
+		return DateRange{day(time.Date(y, 1, 1, 0, 0, 0, 0, loc)), day(time.Date(y, 12, 31, 0, 0, 0, 0, loc))}
+	}
+	return DateRange{}
+}
+
+// detectRangeKind identifie le "grain" d'une plage : correspond-elle exactement
+// a un prereglage (jour, semaine, mois...) ou est-elle libre ("custom") ?
+// C'est ce grain qui donne le pas des fleches de decalage.
+func detectRangeKind(r DateRange) string {
+	if r.Start == "" || r.End == "" || r.Start > r.End {
+		return "custom"
+	}
+	s, err := time.Parse(isoDay, r.Start)
+	if err != nil {
+		return "custom"
+	}
+	e, err := time.Parse(isoDay, r.End)
+	if err != nil {
+		return "custom"
+	}
+
+	if r.Start == r.End {
+		return "day"
+	}
+	if s.Month() == time.January && s.Day() == 1 && e.Equal(time.Date(s.Year(), 12, 31, 0, 0, 0, 0, s.Location())) {
+		return "year"
+	}
+	if s.Day() == 1 && (int(s.Month())-1)%3 == 0 && e.Equal(s.AddDate(0, 3, 0).AddDate(0, 0, -1)) {
+		return "quarter"
+	}
+	if s.Day() == 1 && e.Equal(endOfMonth(s)) {
+		return "month"
+	}
+	if s.Weekday() == time.Monday && e.Equal(s.AddDate(0, 0, 6)) {
+		return "week"
+	}
+	return "custom"
+}
+
+// shiftRange decale la plage d'un cran vers le passe (-1) ou le futur (+1).
+// Le pas suit le grain detecte ; une plage libre se decale de sa propre duree.
+// Une plage non bornee des deux cotes n'est pas decalable.
+func shiftRange(r DateRange, direction int) (DateRange, bool) {
+	if r.Start == "" || r.End == "" {
+		return r, false
+	}
+	s, err := time.Parse(isoDay, r.Start)
+	if err != nil {
+		return r, false
+	}
+	e, err := time.Parse(isoDay, r.End)
+	if err != nil {
+		return r, false
+	}
+	day := func(t time.Time) string { return t.Format(isoDay) }
+
+	switch detectRangeKind(r) {
+	case "day":
+		shifted := s.AddDate(0, 0, direction)
+		return DateRange{day(shifted), day(shifted)}, true
+	case "week":
+		return DateRange{day(s.AddDate(0, 0, 7*direction)), day(e.AddDate(0, 0, 7*direction))}, true
+	case "month":
+		first := s.AddDate(0, direction, 0)
+		return DateRange{day(first), day(endOfMonth(first))}, true
+	case "quarter":
+		first := s.AddDate(0, 3*direction, 0)
+		return DateRange{day(first), day(first.AddDate(0, 3, 0).AddDate(0, 0, -1))}, true
+	case "year":
+		first := s.AddDate(direction, 0, 0)
+		return DateRange{day(first), day(time.Date(first.Year(), 12, 31, 0, 0, 0, 0, first.Location()))}, true
+	default:
+		// Plage libre : on la decale de sa duree, bornes incluses.
+		span := int(e.Sub(s).Hours()/24) + 1
+		step := span * direction
+		return DateRange{day(s.AddDate(0, 0, step)), day(e.AddDate(0, 0, step))}, true
+	}
+}
+
+// filterURL construit le lien du filtre en conservant les categories cochees.
+func filterURL(r DateRange, cats []string) string {
+	params := url.Values{}
+	if r.Start != "" {
+		params.Set("start", r.Start)
+	}
+	if r.End != "" {
+		params.Set("end", r.End)
+	}
+	for _, c := range cats {
+		params.Add("cat", c)
+	}
+	if len(params) == 0 {
+		return "/"
+	}
+	return "/?" + params.Encode()
+}
+
+// rangeLabel resume la plage courante pour la pastille du filtre.
+func rangeLabel(r DateRange) string {
+	day := func(v string) string {
+		if t, err := time.Parse(isoDay, v); err == nil {
+			return t.Format("02/01/2006")
+		}
+		return v
+	}
+	switch {
+	case r.Start != "" && r.End != "":
+		return day(r.Start) + " → " + day(r.End)
+	case r.Start != "":
+		return "dès le " + day(r.Start)
+	case r.End != "":
+		return "jusqu'au " + day(r.End)
+	}
+	return "Dernières 24H"
+}
+
+// buildDateFilter assemble l'etat du filtre par periode pour le gabarit.
+func buildDateFilter(r DateRange, cats []string) DateFilter {
+	f := DateFilter{
+		Start:    r.Start,
+		End:      r.End,
+		Active:   r.Start != "" || r.End != "",
+		Label:    rangeLabel(r),
+		ResetURL: filterURL(DateRange{}, cats),
+	}
+
+	now := time.Now()
+	for _, p := range presetKeys {
+		preset := computePresetRange(p.Key, now)
+		f.Presets = append(f.Presets, PresetLink{
+			Label:  p.Label,
+			URL:    filterURL(preset, cats),
+			Active: preset == r,
+		})
+	}
+
+	if prev, ok := shiftRange(r, -1); ok {
+		f.PrevURL = filterURL(prev, cats)
+	}
+	if next, ok := shiftRange(r, 1); ok {
+		f.NextURL = filterURL(next, cats)
+	}
+	return f
+}
+
+// ==========================================
 // 9. SERVEUR WEB ET HTML
 // ==========================================
 
@@ -800,16 +1095,7 @@ func basicAuth(next http.HandlerFunc) http.HandlerFunc {
 // en un affichage lisible : "29/07/2026 13H".
 // Si le format est inconnu, la valeur brute est renvoyee telle quelle.
 func formatDate(raw string) string {
-	layouts := []string{
-		time.RFC3339,                // 2026-07-29T13:16:30Z
-		"2006-01-02 15:04:05 -0700", // 2026-07-29 13:16:30 +0000
-		"2006-01-02T15:04:05.000Z",  // 2026-07-29T13:16:30.000Z
-		"2006-01-02 15:04:05",       // 2026-07-29 13:16:30
-		"2006-01-02T15:04:05",       // 2026-07-29T13:16:30
-		"2006-01-02",                // 2026-07-29
-	}
-
-	for _, layout := range layouts {
+	for _, layout := range dateLayouts {
 		if t, err := time.Parse(layout, raw); err == nil {
 			return t.Format("02/01/2006 15H")
 		}
@@ -890,6 +1176,30 @@ const htmlTemplate = `
         .filter-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 0; }
         .field { display: flex; align-items: center; gap: 6px; }
 
+        /* --- PASTILLE DE FILTRE PAR PERIODE --- */
+        .date-filter { display: flex; align-items: center; gap: 4px; }
+        .range-nav { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border: 1px solid #ccc; border-radius: 8px; background: white; color: #555; text-decoration: none; font-size: 1.1em; line-height: 1; }
+        .range-nav:hover { background: #f4f4f9; color: #0056b3; border-color: #0056b3; }
+        .range-select { position: relative; }
+        .range-select > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border: 1px solid #ccc; border-radius: 8px; background: white; font-size: 0.9em; white-space: nowrap; }
+        .range-select > summary::-webkit-details-marker { display: none; }
+        .range-select > summary::after { content: "▾"; font-size: 0.8em; color: #888; }
+        .range-select > summary.active { border-color: rgba(0, 86, 179, 0.4); background: #eaf2fb; color: #0056b3; font-weight: bold; }
+        .range-select[open] > summary { border-color: #0056b3; color: #0056b3; }
+        .range-menu { position: absolute; z-index: 10; top: 100%; left: 0; margin-top: 6px; display: flex; flex-direction: column; gap: 12px; background: white; border: 1px solid #ccc; border-radius: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.15); padding: 12px; width: 358px; max-width: calc(100vw - 40px); }
+        .range-presets { display: flex; flex-wrap: wrap; gap: 5px; }
+        .range-presets a { border: 1px solid #ccc; border-radius: 6px; padding: 4px 8px; font-size: 0.78em; font-weight: bold; color: #666; text-decoration: none; }
+        .range-presets a:hover { background: #f4f4f9; color: #333; }
+        .range-presets a.active { border-color: rgba(0, 86, 179, 0.4); background: #eaf2fb; color: #0056b3; }
+        .range-inputs { display: flex; align-items: flex-end; gap: 8px; }
+        .range-inputs label { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+        .range-inputs span { font-size: 0.75em; font-weight: bold; color: #666; }
+        .range-inputs input { width: 100%; }
+        .range-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .range-clear { padding: 5px 8px; border-radius: 6px; font-size: 0.78em; font-weight: bold; color: #666; text-decoration: none; }
+        .range-clear:hover { background: #f4f4f9; color: #333; }
+        .range-actions button { padding: 5px 12px; font-size: 0.78em; font-weight: bold; border-radius: 6px; }
+
         /* --- SELECT A CASES A COCHER (sans JS) --- */
         .cat-select { position: relative; }
         .cat-select > summary { list-style: none; cursor: pointer; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; background: white; font-size: 0.9em; white-space: nowrap; }
@@ -931,10 +1241,9 @@ const htmlTemplate = `
         details.desc { font-size: 0.85em; line-height: 1.4; color: #444; }
         details.desc summary { display: block; cursor: pointer; list-style: none; }
         details.desc summary::-webkit-details-marker { display: none; }
-        details.desc .txt { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-        details.desc[open] .txt { -webkit-line-clamp: unset; overflow: visible; }
-        details.desc .more::after { content: "▾ voir plus"; color: #0056b3; font-size: 0.9em; font-weight: bold; }
-        details.desc[open] .more::after { content: "▴ voir moins"; }
+        details.desc .txt { margin: 6px 0 0 0; }
+        details.desc .more::after { content: "▾ voir la description"; color: #0056b3; font-size: 0.9em; font-weight: bold; }
+        details.desc[open] .more::after { content: "▴ masquer la description"; }
 
         /* --- MOBILE --- */
         @media (max-width: 600px) {
@@ -944,6 +1253,10 @@ const htmlTemplate = `
             .panel { padding: 12px; }
             .filter-form .field { flex: 1 1 100%; }
             .filter-form .field input { flex: 1; }
+            .date-filter { flex: 1 1 100%; }
+            .range-select { flex: 1; min-width: 0; }
+            .range-select > summary { width: 100%; }
+            .range-select > summary .range-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
             .filter-form button, .filter-form .reset-btn { flex: 1 1 100%; text-align: center; }
             .add-form input[type="text"], .add-form select, .add-form button { flex: 1 1 100%; }
             .criteria-cols { gap: 15px; }
@@ -980,8 +1293,35 @@ const htmlTemplate = `
         <!-- ONGLET 1 : FILTRE PAR DATE -->
         <div class="panel panel-filtre">
             <form class="filter-form" method="GET" action="/">
-                <span class="field"><label>Du :</label> <input type="date" name="start" value="{{.Start}}"></span>
-                <span class="field"><label>Au :</label> <input type="date" name="end" value="{{.End}}"></span>
+                {{with .DateFilter}}
+                <div class="date-filter">
+                    {{if .PrevURL}}<a class="range-nav" href="{{.PrevURL}}" title="Période précédente">‹</a>{{end}}
+
+                    <details class="range-select">
+                        <summary class="{{if .Active}}active{{end}}">
+                            <span>📅</span>
+                            <span class="range-label">{{.Label}}</span>
+                        </summary>
+                        <div class="range-menu">
+                            <div class="range-presets">
+                                {{range .Presets}}
+                                <a class="{{if .Active}}active{{end}}" href="{{.URL}}">{{.Label}}</a>
+                                {{end}}
+                            </div>
+                            <div class="range-inputs">
+                                <label><span>Du</span><input type="date" name="start" value="{{.Start}}" max="{{.End}}"></label>
+                                <label><span>Au</span><input type="date" name="end" value="{{.End}}" min="{{.Start}}"></label>
+                            </div>
+                            <div class="range-actions">
+                                <a class="range-clear" href="{{.ResetURL}}">Effacer</a>
+                                <button type="submit">Appliquer</button>
+                            </div>
+                        </div>
+                    </details>
+
+                    {{if .NextURL}}<a class="range-nav" href="{{.NextURL}}" title="Période suivante">›</a>{{end}}
+                </div>
+                {{end}}
 
                 <details class="cat-select">
                     <summary>{{if .NbSelected}}{{.NbSelected}} categorie(s){{else}}Toutes les categories{{end}}</summary>
@@ -1068,7 +1408,8 @@ const htmlTemplate = `
             </div>
             {{if gt (len .Description) 180}}
             <details class="desc">
-                <summary><span class="txt">{{.Description}}</span><span class="more"></span></summary>
+                <summary><span class="more"></span></summary>
+                <p class="txt">{{.Description}}</p>
             </details>
             {{else}}
             <p class="desc-short">{{.Description}}</p>
@@ -1186,7 +1527,9 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			NbSelected  int
 			Logs        []LogEntry
 			LastPrompt  *PromptInfo
-		}{start, end, articles, activeErrors, excludes, criteresTab, logsTab, catChoices, len(selectedCats), logs, lastPrompt})
+			DateFilter  DateFilter
+		}{start, end, articles, activeErrors, excludes, criteresTab, logsTab, catChoices, len(selectedCats), logs, lastPrompt,
+			buildDateFilter(DateRange{start, end}, selectedCats)})
 	}
 }
 

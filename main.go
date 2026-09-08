@@ -57,8 +57,19 @@ type LogEntry struct {
 	Message   string
 }
 
-// Criterion : un critère de recherche modifiable depuis le site.
-// Kind vaut "include" (sujet recherché) ou "exclude" (sujet bloqué).
+// PromptInfo : le dernier prompt envoyé à l'IA, conservé pour être consultable
+// depuis le site (contenu exact + contexte de l'envoi).
+type PromptInfo struct {
+	CreatedAt   string
+	Model       string
+	Temperature float64
+	NbArticles  int
+	Size        int
+	Content     string
+}
+
+// Criterion : un sujet bloqué, modifiable depuis le site. Kind vaut
+// toujours "exclude" (les sujets recherchés n'existent plus).
 type Criterion struct {
 	ID    int
 	Label string
@@ -139,7 +150,7 @@ func initDB(filepath string) (*sql.DB, error) {
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`)
 	_, _ = db.Exec(`ALTER TABLE articles ADD COLUMN categories TEXT DEFAULT ''`)
 
-	// Table des critères de recherche envoyés à l'IA
+	// Table des sujets bloqués envoyés à l'IA
 	criteriaQuery := `
 	CREATE TABLE IF NOT EXISTS criteria (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,6 +160,26 @@ func initDB(filepath string) (*sql.DB, error) {
 	);`
 
 	if _, err = db.Exec(criteriaQuery); err != nil {
+		return nil, err
+	}
+
+	// Les sujets recherchés ont été supprimés : l'IA choisit désormais ses
+	// propres catégories, seuls les sujets bloqués lui sont transmis.
+	_, _ = db.Exec(`DELETE FROM criteria WHERE kind = 'include'`)
+
+	// Dernier prompt envoyé à l'IA (une seule ligne conservée)
+	promptQuery := `
+	CREATE TABLE IF NOT EXISTS prompts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at DATETIME,
+		model TEXT,
+		temperature REAL,
+		nb_articles INTEGER,
+		size INTEGER,
+		content TEXT
+	);`
+
+	if _, err = db.Exec(promptQuery); err != nil {
 		return nil, err
 	}
 
@@ -208,6 +239,52 @@ func getLogs(db *sql.DB, limit int) ([]LogEntry, error) {
 	return entries, nil
 }
 
+// savePrompt remplace le prompt conservé par celui qui vient d'être envoyé.
+func savePrompt(db *sql.DB, p PromptInfo) {
+	if _, err := db.Exec(`DELETE FROM prompts`); err != nil {
+		log.Println("Erreur nettoyage du prompt:", err)
+		return
+	}
+	_, err := db.Exec(
+		`INSERT INTO prompts (created_at, model, temperature, nb_articles, size, content) VALUES (?, ?, ?, ?, ?, ?)`,
+		p.CreatedAt, p.Model, p.Temperature, p.NbArticles, p.Size, p.Content)
+	if err != nil {
+		log.Println("Erreur enregistrement du prompt:", err)
+	}
+}
+
+// getLastPrompt renvoie le dernier prompt envoyé, ou nil s'il n'y en a pas.
+func getLastPrompt(db *sql.DB) (*PromptInfo, error) {
+	var p PromptInfo
+	err := db.QueryRow(
+		`SELECT created_at, model, temperature, nb_articles, size, content FROM prompts ORDER BY id DESC LIMIT 1`).
+		Scan(&p.CreatedAt, &p.Model, &p.Temperature, &p.NbArticles, &p.Size, &p.Content)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// rateLimitHeaders extrait les en-têtes de limitation de débit renvoyés par
+// l'API (x-ratelimit-*, ratelimitbysize-*, retry-after) pour les joindre au
+// journal : sans eux, un 429 ne dit pas quelle limite a sauté ni quand elle
+// se réinitialise.
+func rateLimitHeaders(h http.Header) string {
+	var parts []string
+	for name, values := range h {
+		lower := strings.ToLower(name)
+		if !strings.Contains(lower, "ratelimit") && lower != "retry-after" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s", lower, strings.Join(values, ", ")))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, " | ")
+}
+
 // splitCategories transforme "Go,Docker" en []string{"Go", "Docker"}.
 func splitCategories(raw string) []string {
 	var cats []string
@@ -219,7 +296,38 @@ func splitCategories(raw string) []string {
 	return cats
 }
 
-// getCriteria renvoie tous les critères d'un type donné ("include" ou "exclude").
+// getAllCategories renvoie, triées, toutes les catégories distinctes présentes
+// sur les articles. Les catégories étant inventées par l'IA, c'est la base qui
+// fait référence pour alimenter le filtre du site.
+func getAllCategories(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT DISTINCT categories FROM articles WHERE COALESCE(categories, '') != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]bool)
+	var cats []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		for _, c := range splitCategories(raw) {
+			if !seen[c] {
+				seen[c] = true
+				cats = append(cats, c)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Strings(cats)
+	return cats, nil
+}
+
+// getCriteria renvoie tous les critères d'un type donné ("exclude").
 func getCriteria(db *sql.DB, kind string) ([]Criterion, error) {
 	rows, err := db.Query(`SELECT id, label, kind FROM criteria WHERE kind = ? ORDER BY id`, kind)
 	if err != nil {
@@ -240,12 +348,14 @@ func getCriteria(db *sql.DB, kind string) ([]Criterion, error) {
 	return criteria, nil
 }
 
-func addCriterion(db *sql.DB, label string, kind string) {
+// addCriterion enregistre un sujet bloqué. Les sujets recherchés n'existent
+// plus : l'IA choisit elle-même ses catégories.
+func addCriterion(db *sql.DB, label string) {
 	label = strings.TrimSpace(label)
-	if label == "" || (kind != "include" && kind != "exclude") {
+	if label == "" {
 		return
 	}
-	_, err := db.Exec(`INSERT OR IGNORE INTO criteria (label, kind) VALUES (?, ?)`, label, kind)
+	_, err := db.Exec(`INSERT OR IGNORE INTO criteria (label, kind) VALUES (?, 'exclude')`, label)
 	if err != nil {
 		log.Println("Erreur ajout critère:", err)
 	}
@@ -366,8 +476,12 @@ func parseMistralSelection(content string) (map[int][]string, error) {
 	for _, item := range items {
 		var cats []string
 		for _, c := range item.Categories {
+			if len(cats) >= maxCategoriesPerArticle {
+				break
+			}
 			// La virgule est le séparateur en base : on la retire des libellés.
-			if c = strings.TrimSpace(strings.ReplaceAll(c, ",", " ")); c != "" {
+			c = truncate(strings.ReplaceAll(c, ",", " "), maxCategoryLen)
+			if c != "" {
 				cats = append(cats, c)
 			}
 		}
@@ -385,27 +499,47 @@ func labels(criteria []Criterion) []string {
 	return out
 }
 
-func buildMistralPrompt(articles []Article, includes []Criterion, excludes []Criterion) string {
-	prompt := "Tu es un développeur logiciel senior chargé de filtrer une veille technique et technologique.\n"
-	prompt += "Voici une liste d'articles avec leur ID.\n\n"
-	prompt += "RÈGLES DE SÉLECTION :\n"
-	if len(includes) > 0 {
-		prompt += fmt.Sprintf("- INCLURE : Articles 100%% concrets et techniques utiles à un développeur, correspondant à au moins une de ces catégories : %s.\n", strings.Join(labels(includes), ", "))
+// maxPromptTitleLen borne la longueur des titres envoyés à l'IA : la
+// description n'est plus transmise et les titres sont tronqués pour garder la
+// requête légère (l'API renvoie un 429 quand le prompt devient trop gros).
+const maxPromptTitleLen = 120
+
+// maxCategoryLen borne la longueur d'une catégorie inventée par l'IA.
+const maxCategoryLen = 30
+
+// maxCategoriesPerArticle borne le nombre de catégories gardées par article.
+const maxCategoriesPerArticle = 3
+
+// truncate raccourcit une chaîne à max caractères (runes) sans la couper au
+// milieu d'un caractère multi-octets.
+func truncate(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) <= max {
+		return s
 	}
+	return strings.TrimSpace(string(r[:max])) + "…"
+}
+
+func buildMistralPrompt(articles []Article, excludes []Criterion) string {
+	prompt := "Tu es un développeur logiciel senior chargé de filtrer une veille technique et technologique.\n"
+	prompt += "Voici une liste d'articles avec leur ID et leur titre.\n\n"
+	prompt += "RÈGLES DE SÉLECTION :\n"
+	prompt += "- INCLURE : uniquement les articles concrets et techniques, utiles à un développeur.\n"
 	if len(excludes) > 0 {
 		prompt += fmt.Sprintf("- EXCLURE : %s.\n", strings.Join(labels(excludes), ", "))
 	}
 	prompt += "\n"
-	if len(includes) > 0 {
-		prompt += "Pour chaque article retenu, attribue 1 a 3 categories prises STRICTEMENT dans la liste ci-dessus, en respectant l'orthographe exacte.\n"
-	}
+	prompt += fmt.Sprintf("Pour chaque article retenu, invente 1 a %d categories techniques de ton choix.\n", maxCategoriesPerArticle)
+	prompt += fmt.Sprintf("Une categorie est un mot ou une courte expression (%d caracteres maximum), sans virgule.\n", maxCategoryLen)
+	prompt += "Reutilise les memes libelles d'un article a l'autre quand le sujet est identique, pour limiter le nombre de categories differentes.\n"
 	prompt += "Format de reponse exige : Renvoie UNIQUEMENT un tableau JSON, sans aucun autre texte.\n"
 	prompt += "Chaque element contient l'id de l'article et ses categories.\n"
 	prompt += "Exemple : [{\"id\": 1, \"categories\": [\"Backend\", \"DevOps\"]}, {\"id\": 5, \"categories\": [\"Securite\"]}]\n\n"
 	prompt += "Articles :\n"
 
 	for _, a := range articles {
-		prompt += fmt.Sprintf("ID: %d | Titre: %s | Extrait: %s\n", a.ID, a.Title, a.Description)
+		prompt += fmt.Sprintf("ID: %d | %s\n", a.ID, truncate(a.Title, maxPromptTitleLen))
 	}
 	return prompt
 }
@@ -473,20 +607,27 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 	// APPEL MISTRAL ET SAUVEGARDE EN BDD
 	mistralKey := os.Getenv("MISTRAL_API_KEY")
 	if mistralKey != "" && len(allFetchedArticles) > 0 {
-		includes, err := getCriteria(db, "include")
-		if err != nil {
-			log.Println("Erreur lecture des critères (include):", err)
-		}
 		excludes, err := getCriteria(db, "exclude")
 		if err != nil {
 			log.Println("Erreur lecture des critères (exclude):", err)
 		}
 
-		prompt := buildMistralPrompt(allFetchedArticles, includes, excludes)
+		prompt := buildMistralPrompt(allFetchedArticles, excludes)
+		model := getEnv("MISTRAL_MODEL", "mistral-small-latest")
+		temperature := getEnvFloat("MISTRAL_TEMPERATURE", 0.1)
+
+		savePrompt(db, PromptInfo{
+			CreatedAt:   time.Now().Format("2006-01-02 15:04:05"),
+			Model:       model,
+			Temperature: temperature,
+			NbArticles:  len(allFetchedArticles),
+			Size:        len(prompt),
+			Content:     prompt,
+		})
 
 		reqBody := MistralRequest{
-			Model:       getEnv("MISTRAL_MODEL", "mistral-small-latest"),
-			Temperature: getEnvFloat("MISTRAL_TEMPERATURE", 0.1),
+			Model:       model,
+			Temperature: temperature,
 			Messages: []MistralMessage{
 				{Role: "user", Content: prompt},
 			},
@@ -514,7 +655,13 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			logProblem(db, "Appel Mistral", "Code HTTP %d - Réponse : %s", resp.StatusCode, string(bodyBytes))
+			// Sur un 429, les en-têtes disent quelle limite a été atteinte et
+			// quand elle se réinitialise : on les journalise avec l'erreur.
+			if limits := rateLimitHeaders(resp.Header); limits != "" {
+				logProblem(db, "Appel Mistral", "Code HTTP %d - Limites : %s - Réponse : %s", resp.StatusCode, limits, string(bodyBytes))
+			} else {
+				logProblem(db, "Appel Mistral", "Code HTTP %d - Réponse : %s", resp.StatusCode, string(bodyBytes))
+			}
 			return
 		}
 
@@ -552,14 +699,10 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 			return
 		}
 
-		// Vérification du contenu : les IDs et catégories doivent exister.
+		// Vérification du contenu : les IDs doivent exister.
 		knownIDs := make(map[int]bool)
 		for _, a := range allFetchedArticles {
 			knownIDs[a.ID] = true
-		}
-		knownCats := make(map[string]bool)
-		for _, c := range includes {
-			knownCats[c.Label] = true
 		}
 
 		var unknownIDs []string
@@ -573,38 +716,18 @@ func fetchAllSources(db *sql.DB, sources []APISource) {
 			logProblem(db, "Réponse Mistral", "%d ID(s) inconnu(s) ignoré(s) : %s", len(unknownIDs), strings.Join(unknownIDs, ", "))
 		}
 
-		// On isole uniquement les articles validés par l'IA
+		// On isole uniquement les articles validés par l'IA. Les catégories
+		// sont librement choisies par l'IA : on les conserve telles quelles.
 		var validArticles []Article
-		unknownCats := make(map[string]bool)
 		for i := range allFetchedArticles {
 			cats, ok := selected[allFetchedArticles[i].ID]
 			if !ok {
 				continue
 			}
 
-			// Seules les catégories connues sont conservées, sinon le filtre
-			// du site ne pourrait pas les proposer.
-			var validCats []string
-			for _, c := range cats {
-				if knownCats[c] {
-					validCats = append(validCats, c)
-				} else {
-					unknownCats[c] = true
-				}
-			}
-
 			allFetchedArticles[i].MistralValid = true
-			allFetchedArticles[i].Categories = validCats
+			allFetchedArticles[i].Categories = cats
 			validArticles = append(validArticles, allFetchedArticles[i])
-		}
-
-		if len(unknownCats) > 0 {
-			var list []string
-			for c := range unknownCats {
-				list = append(list, c)
-			}
-			sort.Strings(list)
-			logProblem(db, "Réponse Mistral", "Catégorie(s) hors liste ignorée(s) : %s", strings.Join(list, ", "))
 		}
 
 		// SAUVEGARDE EN BDD : Uniquement les articles validés !
@@ -737,6 +860,23 @@ const htmlTemplate = `
         .tab-bar .badge { background: #d32f2f; color: white; border-radius: 9px; padding: 0 6px; font-size: 0.8em; margin-left: 4px; }
 
         /* --- JOURNAL --- */
+        /* --- BOUTON FLECHE + POPUP DU PROMPT --- */
+        .logs-head { display: flex; align-items: flex-start; gap: 10px; }
+        .logs-head .hint { flex: 1; }
+        .prompt-btn { flex: none; width: 30px; height: 30px; border-radius: 50%; background: #0056b3; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 0.95em; user-select: none; }
+        .prompt-btn:hover { background: #003d80; }
+        #prompt-modal { position: absolute; opacity: 0; pointer-events: none; }
+        .modal { display: none; position: fixed; inset: 0; z-index: 50; padding: 20px; }
+        #prompt-modal:checked ~ .modal { display: block; }
+        .modal-bg { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); cursor: pointer; }
+        .modal-box { position: relative; z-index: 1; background: white; border-radius: 10px; max-width: 900px; margin: 0 auto; max-height: 90vh; display: flex; flex-direction: column; padding: 16px 20px; }
+        .modal-head { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; }
+        .modal-head h3 { margin: 0; font-size: 1em; flex: 1; }
+        .modal-close { cursor: pointer; font-size: 1.2em; color: #666; line-height: 1; }
+        .prompt-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+        .prompt-meta span { background: #eef2f7; color: #334; border-radius: 10px; padding: 2px 9px; font-size: 0.75em; }
+        .prompt-text { flex: 1; overflow: auto; margin: 0; background: #f7f9fc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 0.78em; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
+
         .log-list { display: flex; flex-direction: column; gap: 8px; }
         .log-item { border-left: 3px solid #f44336; background: #fdf6f6; border-radius: 4px; padding: 8px 12px; }
         .log-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.75em; color: #666; margin-bottom: 4px; }
@@ -771,8 +911,7 @@ const htmlTemplate = `
         .criteria-col { flex: 1 1 240px; min-width: 0; }
         .criteria-col h4 { margin: 0 0 10px 0; font-size: 0.9em; }
         .tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px 3px 10px; border-radius: 12px; margin: 0 6px 6px 0; font-size: 0.85em; }
-        .tag.include { background: #e8f5e9; color: #1b5e20; }
-        .tag.exclude { background: #ffebee; color: #b71c1c; }
+            .tag.exclude { background: #ffebee; color: #b71c1c; }
         .tag form { display: inline; margin: 0; }
         .tag button { background: none; border: none; cursor: pointer; color: inherit; font-size: 1em; padding: 0 3px; opacity: 0.6; }
         .tag button:hover { opacity: 1; }
@@ -865,24 +1004,9 @@ const htmlTemplate = `
 
         <!-- ONGLET 2 : CRITÈRES DE RECHERCHE DE L'IA -->
         <div class="panel panel-criteres">
-            <p class="hint">Ces critères sont envoyés à l'IA lors de la prochaine récupération. Les sujets recherchés servent aussi de catégories pour classer les articles et alimentent le filtre par catégorie.</p>
+            <p class="hint">Ces sujets bloqués sont envoyés à l'IA lors de la prochaine récupération. Les catégories, elles, sont choisies librement par l'IA et alimentent le filtre par catégorie.</p>
 
             <div class="criteria-cols">
-                <div class="criteria-col">
-                    <h4>✅ Sujets recherchés (= catégories)</h4>
-                    {{range .Includes}}
-                    <span class="tag include">
-                        {{.Label}}
-                        <form method="POST" action="/criteres/supprimer">
-                            <input type="hidden" name="id" value="{{.ID}}">
-                            <button type="submit" title="Supprimer">✕</button>
-                        </form>
-                    </span>
-                    {{else}}
-                    <p class="hint">Aucun sujet recherché.</p>
-                    {{end}}
-                </div>
-
                 <div class="criteria-col">
                     <h4>🚫 Sujets bloqués</h4>
                     {{range .Excludes}}
@@ -900,18 +1024,17 @@ const htmlTemplate = `
             </div>
 
             <form class="add-form" method="POST" action="/criteres/ajouter">
-                <input type="text" name="label" placeholder="Ex: CVE, Kubernetes, Rust..." required>
-                <select name="kind">
-                    <option value="include">✅ Rechercher</option>
-                    <option value="exclude">🚫 Bloquer</option>
-                </select>
-                <button type="submit">Ajouter</button>
+                <input type="text" name="label" placeholder="Ex: crypto, politique, sport..." required>
+                <button type="submit">🚫 Bloquer</button>
             </form>
         </div>
 
         <!-- ONGLET 3 : JOURNAL DES PROBLEMES -->
         <div class="panel panel-logs">
-            <p class="hint">Problèmes rencontrés lors des récupérations (réponses de l'IA invalides, erreurs réseau...). Les 50 plus récents sont affichés.</p>
+            <div class="logs-head">
+                <p class="hint">Problèmes rencontrés lors des récupérations (réponses de l'IA invalides, erreurs réseau...). Les 50 plus récents sont affichés.</p>
+                <label class="prompt-btn" for="prompt-modal" title="Voir le dernier prompt envoyé à l'IA">➤</label>
+            </div>
 
             {{if .Logs}}
             <div class="log-list">
@@ -955,6 +1078,29 @@ const htmlTemplate = `
     {{else}}
         <p>Aucun article technique pertinent trouvé pour cette période.</p>
     {{end}}
+    <!-- POPUP : DERNIER PROMPT ENVOYE A L'IA -->
+    <input type="checkbox" id="prompt-modal">
+    <div class="modal">
+        <label class="modal-bg" for="prompt-modal"></label>
+        <div class="modal-box">
+            <div class="modal-head">
+                <h3>➤ Dernier prompt envoyé à l'IA</h3>
+                <label class="modal-close" for="prompt-modal" title="Fermer">✕</label>
+            </div>
+            {{with .LastPrompt}}
+            <div class="prompt-meta">
+                <span>📅 {{formatDateTime .CreatedAt}}</span>
+                <span>🤖 {{.Model}}</span>
+                <span>🌡️ {{.Temperature}}</span>
+                <span>📰 {{.NbArticles}} articles</span>
+                <span>📏 {{.Size}} caractères</span>
+            </div>
+            <pre class="prompt-text">{{.Content}}</pre>
+            {{else}}
+            <p class="hint">Aucun prompt envoyé pour l'instant.</p>
+            {{end}}
+        </div>
+    </div>
 </body>
 </html>
 `
@@ -990,23 +1136,24 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			return activeErrors[i].SourceName < activeErrors[j].SourceName
 		})
 
-		includes, err := getCriteria(db, "include")
-		if err != nil {
-			log.Println("Erreur lors de la récupération des critères (include):", err)
-		}
 		excludes, err := getCriteria(db, "exclude")
 		if err != nil {
 			log.Println("Erreur lors de la récupération des critères (exclude):", err)
 		}
 
-		// Les critères recherchés servent aussi de catégories : les cases à
-		// cocher du filtre reprennent donc exactement cette liste.
+		// Les catégories sont inventées par l'IA : les cases à cocher du
+		// filtre reprennent celles réellement présentes en base.
+		allCats, err := getAllCategories(db)
+		if err != nil {
+			log.Println("Erreur lors de la récupération des catégories:", err)
+		}
+
 		type CategoryChoice struct {
 			Name    string
 			Checked bool
 		}
 		var catChoices []CategoryChoice
-		for _, c := range labels(includes) {
+		for _, c := range allCats {
 			checked := false
 			for _, sel := range selectedCats {
 				if sel == c {
@@ -1022,35 +1169,40 @@ func handleIndex(db *sql.DB) http.HandlerFunc {
 			log.Println("Erreur lors de la récupération du journal:", err)
 		}
 
+		lastPrompt, err := getLastPrompt(db)
+		if err != nil {
+			log.Println("Erreur lors de la récupération du dernier prompt:", err)
+		}
+
 		tmpl.Execute(w, struct {
 			Start       string
 			End         string
 			Articles    []Article
 			Errors      []APIStatus
-			Includes    []Criterion
 			Excludes    []Criterion
 			CriteresTab bool
 			LogsTab     bool
 			Categories  []CategoryChoice
 			NbSelected  int
 			Logs        []LogEntry
-		}{start, end, articles, activeErrors, includes, excludes, criteresTab, logsTab, catChoices, len(selectedCats), logs})
+			LastPrompt  *PromptInfo
+		}{start, end, articles, activeErrors, excludes, criteresTab, logsTab, catChoices, len(selectedCats), logs, lastPrompt})
 	}
 }
 
-// handleAddCriterion enregistre un nouveau critère de recherche.
+// handleAddCriterion enregistre un nouveau sujet bloqué.
 func handleAddCriterion(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
 			return
 		}
-		addCriterion(db, r.FormValue("label"), r.FormValue("kind"))
+		addCriterion(db, r.FormValue("label"))
 		http.Redirect(w, r, "/?tab=criteres", http.StatusSeeOther)
 	}
 }
 
-// handleDeleteCriterion supprime un critère de recherche.
+// handleDeleteCriterion supprime un sujet bloqué.
 func handleDeleteCriterion(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

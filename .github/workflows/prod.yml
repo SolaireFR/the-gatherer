@@ -1,10 +1,9 @@
-name: Build and Push Docker Image
+name: Build and Push Prod Docker Image
 
 on:
   push:
     branches:
-      - main
-      - master
+      - prod
 
 env:
   REGISTRY: ghcr.io
@@ -20,18 +19,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Étape magique : on convertit le nom du dépôt en minuscules et on le stocke dans une variable globale
+      # Nom du depot en minuscules (contrainte GHCR)
       - name: Downcase repository name
         run: |
           echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
-      
-      - name: Extract version from docker-compose
+
+      # Tag au format <10 premiers caracteres du hash du commit>-prod
+      - name: Compute image tag
         run: |
-          # Cherche "the-gatherer:" et récupère ce qui suit (la version)
-          VERSION=$(grep -oP 'the-gatherer:\K[a-zA-Z0-9_.-]+' docker-compose.prod.yml | head -n 1)
-          echo "IMAGE_VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Version trouvée : $VERSION"
-        
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-10)
+          echo "IMAGE_TAG=${SHORT_SHA}-prod" >> ${GITHUB_ENV}
+          echo "Tag genere : ${SHORT_SHA}-prod"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -42,17 +41,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # On utilise la variable ${{ env.IMAGE_NAME }} qui est maintenant garantie en minuscules
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile.prod
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      
-      # LA DERNIÈRE ÉTAPE : On prévient Portainer que l'image est prête
-      - name: Trigger Portainer Webhook
-        run: curl -X POST "${{ secrets.PORTAINER_WEBHOOK }}"

@@ -7,6 +7,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./main.go:/app/main.go
+      - ./page.html:/app/page.html
+      - ./favicon.svg:/app/favicon.svg
       # Caches Go conservés à la racine du projet : les dépendances ne sont
       # téléchargées qu'une seule fois et la recompilation est quasi instantanée.
       - ./.gocache/mod:/go/pkg/mod

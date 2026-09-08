@@ -8,7 +8,9 @@ ENV CGO_ENABLED=0
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go ./
+# page.html est embarque dans le binaire (//go:embed) : il doit etre present
+# a la compilation, mais plus rien n'est a deployer a cote de l'executable.
+COPY main.go page.html favicon.svg ./
 RUN go build -v -o veille-app main.go
 
 FROM alpine:3.20

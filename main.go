@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"database/sql"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -1114,337 +1115,25 @@ func formatDateTime(raw string) string {
 	return raw
 }
 
-const htmlTemplate = `
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The Gatherer (Veille info-tech)</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; background-color: #f4f4f9; color: #333; overflow-wrap: break-word; }
-        h1 { font-size: 1.5em; }
+// htmlTemplate : le gabarit de la page, edite dans page.html et embarque
+// dans le binaire a la compilation (aucun fichier a deployer a cote).
+//
+//go:embed page.html
+var htmlTemplate string
 
-        .errors-container { background: #ffebee; border-left: 5px solid #f44336; padding: 12px 15px; margin-bottom: 20px; border-radius: 4px; }
-        .errors-container h3 { margin-top: 0; color: #d32f2f; font-size: 1em; }
-        .error-item { margin-bottom: 8px; font-size: 0.85em; }
-        .error-item strong { color: #b71c1c; }
+// faviconSVG : le logo du site, embarque lui aussi. Il sert a la fois d'icone
+// d'onglet et de logo dans l'en-tete de la page.
+//
+//go:embed favicon.svg
+var faviconSVG []byte
 
-        /* --- ONGLETS (sans JS : radios cachées + sélecteur :checked) --- */
-        .tabs { margin-bottom: 20px; }
-        .tabs > input { position: absolute; opacity: 0; pointer-events: none; }
-        .tab-bar { display: flex; gap: 4px; }
-        .tab-bar label { flex: 1; text-align: center; padding: 10px 6px; background: #e2e8f0; border-radius: 8px 8px 0 0; cursor: pointer; font-weight: bold; font-size: 0.9em; color: #555; }
-        .panel { display: none; background: white; padding: 15px; border-radius: 0 0 8px 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        #tab-filtre:checked ~ .tab-bar label[for="tab-filtre"] { background: white; color: #0056b3; }
-        #tab-criteres:checked ~ .tab-bar label[for="tab-criteres"] { background: white; color: #0056b3; }
-        #tab-logs:checked ~ .tab-bar label[for="tab-logs"] { background: white; color: #0056b3; }
-        #tab-filtre:checked ~ .panel-filtre { display: block; }
-        #tab-criteres:checked ~ .panel-criteres { display: block; }
-        #tab-logs:checked ~ .panel-logs { display: block; }
-        .tab-bar .badge { background: #d32f2f; color: white; border-radius: 9px; padding: 0 6px; font-size: 0.8em; margin-left: 4px; }
-
-        /* --- JOURNAL --- */
-        /* --- BOUTON FLECHE + POPUP DU PROMPT --- */
-        .logs-head { display: flex; align-items: flex-start; gap: 10px; }
-        .logs-head .hint { flex: 1; }
-        .prompt-btn { flex: none; width: 30px; height: 30px; border-radius: 50%; background: #0056b3; color: white; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 0.95em; user-select: none; }
-        .prompt-btn:hover { background: #003d80; }
-        #prompt-modal { position: absolute; opacity: 0; pointer-events: none; }
-        .modal { display: none; position: fixed; inset: 0; z-index: 50; padding: 20px; }
-        #prompt-modal:checked ~ .modal { display: block; }
-        .modal-bg { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); cursor: pointer; }
-        .modal-box { position: relative; z-index: 1; background: white; border-radius: 10px; max-width: 900px; margin: 0 auto; max-height: 90vh; display: flex; flex-direction: column; padding: 16px 20px; }
-        .modal-head { display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; }
-        .modal-head h3 { margin: 0; font-size: 1em; flex: 1; }
-        .modal-close { cursor: pointer; font-size: 1.2em; color: #666; line-height: 1; }
-        .prompt-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
-        .prompt-meta span { background: #eef2f7; color: #334; border-radius: 10px; padding: 2px 9px; font-size: 0.75em; }
-        .prompt-text { flex: 1; overflow: auto; margin: 0; background: #f7f9fc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px; font-family: Consolas, monospace; font-size: 0.78em; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
-
-        .log-list { display: flex; flex-direction: column; gap: 8px; }
-        .log-item { border-left: 3px solid #f44336; background: #fdf6f6; border-radius: 4px; padding: 8px 12px; }
-        .log-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.75em; color: #666; margin-bottom: 4px; }
-        .log-context { background: #ffebee; color: #b71c1c; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
-        .log-msg { margin: 0; font-size: 0.85em; line-height: 1.4; color: #444; font-family: Consolas, monospace; word-break: break-word; }
-
-        input[type="date"], input[type="text"], select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 0.9em; max-width: 100%; }
-        button { background-color: #0056b3; color: white; cursor: pointer; border: none; }
-        .reset-btn { text-decoration: none; padding: 8px 12px; background: #e0e0e0; border-radius: 4px; color: #333; font-size: 0.9em; }
-
-        .filter-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 0; }
-        .field { display: flex; align-items: center; gap: 6px; }
-
-        /* --- PASTILLE DE FILTRE PAR PERIODE --- */
-        .date-filter { display: flex; align-items: center; gap: 4px; }
-        .range-nav { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border: 1px solid #ccc; border-radius: 8px; background: white; color: #555; text-decoration: none; font-size: 1.1em; line-height: 1; }
-        .range-nav:hover { background: #f4f4f9; color: #0056b3; border-color: #0056b3; }
-        .range-select { position: relative; }
-        .range-select > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border: 1px solid #ccc; border-radius: 8px; background: white; font-size: 0.9em; white-space: nowrap; }
-        .range-select > summary::-webkit-details-marker { display: none; }
-        .range-select > summary::after { content: "▾"; font-size: 0.8em; color: #888; }
-        .range-select > summary.active { border-color: rgba(0, 86, 179, 0.4); background: #eaf2fb; color: #0056b3; font-weight: bold; }
-        .range-select[open] > summary { border-color: #0056b3; color: #0056b3; }
-        .range-menu { position: absolute; z-index: 10; top: 100%; left: 0; margin-top: 6px; display: flex; flex-direction: column; gap: 12px; background: white; border: 1px solid #ccc; border-radius: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.15); padding: 12px; width: 358px; max-width: calc(100vw - 40px); }
-        .range-presets { display: flex; flex-wrap: wrap; gap: 5px; }
-        .range-presets a { border: 1px solid #ccc; border-radius: 6px; padding: 4px 8px; font-size: 0.78em; font-weight: bold; color: #666; text-decoration: none; }
-        .range-presets a:hover { background: #f4f4f9; color: #333; }
-        .range-presets a.active { border-color: rgba(0, 86, 179, 0.4); background: #eaf2fb; color: #0056b3; }
-        .range-inputs { display: flex; align-items: flex-end; gap: 8px; }
-        .range-inputs label { flex: 1; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-        .range-inputs span { font-size: 0.75em; font-weight: bold; color: #666; }
-        .range-inputs input { width: 100%; }
-        .range-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-        .range-clear { padding: 5px 8px; border-radius: 6px; font-size: 0.78em; font-weight: bold; color: #666; text-decoration: none; }
-        .range-clear:hover { background: #f4f4f9; color: #333; }
-        .range-actions button { padding: 5px 12px; font-size: 0.78em; font-weight: bold; border-radius: 6px; }
-
-        /* --- SELECT A CASES A COCHER (sans JS) --- */
-        .cat-select { position: relative; }
-        .cat-select > summary { list-style: none; cursor: pointer; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; background: white; font-size: 0.9em; white-space: nowrap; }
-        .cat-select > summary::-webkit-details-marker { display: none; }
-        .cat-select > summary::after { content: " \25BE"; }
-        .cat-select[open] > summary { border-color: #0056b3; color: #0056b3; }
-        .cat-menu { position: absolute; z-index: 10; top: 100%; left: 0; margin-top: 4px; background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); padding: 8px; min-width: 220px; max-height: 260px; overflow-y: auto; }
-        .cat-menu label { display: flex; align-items: center; gap: 8px; padding: 5px 4px; font-size: 0.9em; cursor: pointer; border-radius: 3px; }
-        .cat-menu label:hover { background: #f4f4f9; }
-        .cat-menu input { margin: 0; }
-        .cat-empty { color: #666; font-size: 0.85em; margin: 0; padding: 4px; }
-
-        /* --- CHIPS DE CATEGORIE SUR LES ARTICLES --- */
-        .cat-chip { background: #ede7f6; color: #4527a0; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
-
-        /* --- CRITÈRES --- */
-        .hint { color: #666; font-size: 0.85em; margin: 0 0 12px 0; }
-        .criteria-cols { display: flex; flex-wrap: wrap; gap: 20px; }
-        .criteria-col { flex: 1 1 240px; min-width: 0; }
-        .criteria-col h4 { margin: 0 0 10px 0; font-size: 0.9em; }
-        .tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 5px 3px 10px; border-radius: 12px; margin: 0 6px 6px 0; font-size: 0.85em; }
-            .tag.exclude { background: #ffebee; color: #b71c1c; }
-        .tag form { display: inline; margin: 0; }
-        .tag button { background: none; border: none; cursor: pointer; color: inherit; font-size: 1em; padding: 0 3px; opacity: 0.6; }
-        .tag button:hover { opacity: 1; }
-        .add-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 15px; border-top: 1px solid #eee; padding-top: 15px; }
-        .add-form input[type="text"] { flex: 1 1 200px; min-width: 0; }
-
-        /* --- ARTICLES (compacts) --- */
-        .article { background: white; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 3px solid #0056b3; }
-        .article h2 { margin: 0 0 4px 0; font-size: 1em; line-height: 1.3; }
-        .article a { color: #0056b3; text-decoration: none; }
-        .article a:hover { text-decoration: underline; }
-        .meta { color: #666; font-size: 0.75em; margin-bottom: 5px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-        .source { background: #e2e8f0; padding: 1px 7px; border-radius: 10px; font-weight: bold; }
-
-        /* --- DESCRIPTION REPLIABLE --- */
-        .desc-short { margin: 0; font-size: 0.85em; line-height: 1.4; color: #444; }
-        details.desc { font-size: 0.85em; line-height: 1.4; color: #444; }
-        details.desc summary { display: block; cursor: pointer; list-style: none; }
-        details.desc summary::-webkit-details-marker { display: none; }
-        details.desc .txt { margin: 6px 0 0 0; }
-        details.desc .more::after { content: "▾ voir la description"; color: #0056b3; font-size: 0.9em; font-weight: bold; }
-        details.desc[open] .more::after { content: "▴ masquer la description"; }
-
-        /* --- MOBILE --- */
-        @media (max-width: 600px) {
-            body { margin: 15px auto; padding: 0 12px; }
-            h1 { font-size: 1.2em; }
-            .tab-bar label { font-size: 0.8em; padding: 10px 4px; }
-            .panel { padding: 12px; }
-            .filter-form .field { flex: 1 1 100%; }
-            .filter-form .field input { flex: 1; }
-            .date-filter { flex: 1 1 100%; }
-            .range-select { flex: 1; min-width: 0; }
-            .range-select > summary { width: 100%; }
-            .range-select > summary .range-label { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-            .filter-form button, .filter-form .reset-btn { flex: 1 1 100%; text-align: center; }
-            .add-form input[type="text"], .add-form select, .add-form button { flex: 1 1 100%; }
-            .criteria-cols { gap: 15px; }
-            .article { padding: 9px 12px; }
-        }
-    </style>
-</head>
-<body>
-    <h1>🚀 The Gatherer - Veille</h1>
-
-    {{if .Errors}}
-    <div class="errors-container">
-        <h3>⚠️ Problème de synchronisation API</h3>
-        {{range .Errors}}
-        <div class="error-item">
-            <strong>{{.SourceName}}</strong> (Dernier essai : {{.LastCheck}}) <br>
-            <i>Détail : {{.ErrorMsg}}</i>
-        </div>
-        {{end}}
-    </div>
-    {{end}}
-
-    <div class="tabs">
-        <input type="radio" name="tab" id="tab-filtre" {{if not .CriteresTab}}checked{{end}}>
-        <input type="radio" name="tab" id="tab-criteres" {{if .CriteresTab}}checked{{end}}>
-        <input type="radio" name="tab" id="tab-logs" {{if .LogsTab}}checked{{end}}>
-
-        <div class="tab-bar">
-            <label for="tab-filtre">📅 Filtre</label>
-            <label for="tab-criteres">🎯 Critères de l'IA</label>
-            <label for="tab-logs">⚠️ Journal{{if .Logs}}<span class="badge">{{len .Logs}}</span>{{end}}</label>
-        </div>
-
-        <!-- ONGLET 1 : FILTRE PAR DATE -->
-        <div class="panel panel-filtre">
-            <form class="filter-form" method="GET" action="/">
-                {{with .DateFilter}}
-                <div class="date-filter">
-                    {{if .PrevURL}}<a class="range-nav" href="{{.PrevURL}}" title="Période précédente">‹</a>{{end}}
-
-                    <details class="range-select">
-                        <summary class="{{if .Active}}active{{end}}">
-                            <span>📅</span>
-                            <span class="range-label">{{.Label}}</span>
-                        </summary>
-                        <div class="range-menu">
-                            <div class="range-presets">
-                                {{range .Presets}}
-                                <a class="{{if .Active}}active{{end}}" href="{{.URL}}">{{.Label}}</a>
-                                {{end}}
-                            </div>
-                            <div class="range-inputs">
-                                <label><span>Du</span><input type="date" name="start" value="{{.Start}}" max="{{.End}}"></label>
-                                <label><span>Au</span><input type="date" name="end" value="{{.End}}" min="{{.Start}}"></label>
-                            </div>
-                            <div class="range-actions">
-                                <a class="range-clear" href="{{.ResetURL}}">Effacer</a>
-                                <button type="submit">Appliquer</button>
-                            </div>
-                        </div>
-                    </details>
-
-                    {{if .NextURL}}<a class="range-nav" href="{{.NextURL}}" title="Période suivante">›</a>{{end}}
-                </div>
-                {{end}}
-
-                <details class="cat-select">
-                    <summary>{{if .NbSelected}}{{.NbSelected}} categorie(s){{else}}Toutes les categories{{end}}</summary>
-                    <div class="cat-menu">
-                        {{range .Categories}}
-                        <label>
-                            <input type="checkbox" name="cat" value="{{.Name}}" {{if .Checked}}checked{{end}}>
-                            {{.Name}}
-                        </label>
-                        {{else}}
-                        <p class="cat-empty">Aucune categorie pour l'instant.</p>
-                        {{end}}
-                    </div>
-                </details>
-
-                <button type="submit">Filtrer</button>
-                <a href="/" class="reset-btn">Reset (24H)</a>
-            </form>
-        </div>
-
-        <!-- ONGLET 2 : CRITÈRES DE RECHERCHE DE L'IA -->
-        <div class="panel panel-criteres">
-            <p class="hint">Ces sujets bloqués sont envoyés à l'IA lors de la prochaine récupération. Les catégories, elles, sont choisies librement par l'IA et alimentent le filtre par catégorie.</p>
-
-            <div class="criteria-cols">
-                <div class="criteria-col">
-                    <h4>🚫 Sujets bloqués</h4>
-                    {{range .Excludes}}
-                    <span class="tag exclude">
-                        {{.Label}}
-                        <form method="POST" action="/criteres/supprimer">
-                            <input type="hidden" name="id" value="{{.ID}}">
-                            <button type="submit" title="Supprimer">✕</button>
-                        </form>
-                    </span>
-                    {{else}}
-                    <p class="hint">Aucun sujet bloqué.</p>
-                    {{end}}
-                </div>
-            </div>
-
-            <form class="add-form" method="POST" action="/criteres/ajouter">
-                <input type="text" name="label" placeholder="Ex: crypto, politique, sport..." required>
-                <button type="submit">🚫 Bloquer</button>
-            </form>
-        </div>
-
-        <!-- ONGLET 3 : JOURNAL DES PROBLEMES -->
-        <div class="panel panel-logs">
-            <div class="logs-head">
-                <p class="hint">Problèmes rencontrés lors des récupérations (réponses de l'IA invalides, erreurs réseau...). Les 50 plus récents sont affichés.</p>
-                <label class="prompt-btn" for="prompt-modal" title="Voir le dernier prompt envoyé à l'IA">➤</label>
-            </div>
-
-            {{if .Logs}}
-            <div class="log-list">
-                {{range .Logs}}
-                <div class="log-item">
-                    <div class="log-head">
-                        <span class="log-context">{{.Context}}</span>
-                        <span>{{formatDateTime .CreatedAt}}</span>
-                    </div>
-                    <p class="log-msg">{{.Message}}</p>
-                </div>
-                {{end}}
-            </div>
-            {{else}}
-            <p class="hint">Aucun problème enregistré.</p>
-            {{end}}
-        </div>
-    </div>
-
-    <!-- LISTE ARTICLES -->
-    {{if .Articles}}
-        {{range .Articles}}
-        <div class="article">
-            <h2><a href="{{.Link}}" target="_blank">{{.Title}}</a></h2>
-            <div class="meta">
-                <span class="source">{{.Source}}</span>
-                <span>📅 {{formatDate .Date}}</span>
-                {{range .Categories}}
-                    <span class="cat-chip">{{.}}</span>
-                {{end}}
-            </div>
-            {{if gt (len .Description) 180}}
-            <details class="desc">
-                <summary><span class="more"></span></summary>
-                <p class="txt">{{.Description}}</p>
-            </details>
-            {{else}}
-            <p class="desc-short">{{.Description}}</p>
-            {{end}}
-        </div>
-        {{end}}
-    {{else}}
-        <p>Aucun article technique pertinent trouvé pour cette période.</p>
-    {{end}}
-    <!-- POPUP : DERNIER PROMPT ENVOYE A L'IA -->
-    <input type="checkbox" id="prompt-modal">
-    <div class="modal">
-        <label class="modal-bg" for="prompt-modal"></label>
-        <div class="modal-box">
-            <div class="modal-head">
-                <h3>➤ Dernier prompt envoyé à l'IA</h3>
-                <label class="modal-close" for="prompt-modal" title="Fermer">✕</label>
-            </div>
-            {{with .LastPrompt}}
-            <div class="prompt-meta">
-                <span>📅 {{formatDateTime .CreatedAt}}</span>
-                <span>🤖 {{.Model}}</span>
-                <span>🌡️ {{.Temperature}}</span>
-                <span>📰 {{.NbArticles}} articles</span>
-                <span>📏 {{.Size}} caractères</span>
-            </div>
-            <pre class="prompt-text">{{.Content}}</pre>
-            {{else}}
-            <p class="hint">Aucun prompt envoyé pour l'instant.</p>
-            {{end}}
-        </div>
-    </div>
-</body>
-</html>
-`
+// handleFavicon sert le logo. Volontairement hors authentification : le
+// navigateur le reclame avant meme que l'utilisateur ne se soit identifie.
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Write(faviconSVG)
+}
 
 func handleIndex(db *sql.DB) http.HandlerFunc {
 	tmpl := template.Must(template.New("index").
@@ -1678,6 +1367,7 @@ func main() {
 
 	startCron(db, sources)
 
+	http.HandleFunc("/favicon.svg", handleFavicon)
 	http.HandleFunc("/", basicAuth(handleIndex(db)))
 	http.HandleFunc("/criteres/ajouter", basicAuth(handleAddCriterion(db)))
 	http.HandleFunc("/criteres/supprimer", basicAuth(handleDeleteCriterion(db)))

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200" fill="none">
+  <defs>
+    <!-- Dégradé radial pour le petit cercle (Bleu) -->
+    <radialGradient id="blueGradient" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#60A5FA" />
+      <stop offset="100%" stop-color="#1E3A8A" />
+    </radialGradient>
+
+    <!-- Dégradé radial pour le grand cercle (Violet) -->
+    <radialGradient id="purpleGradient" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+      <stop offset="0%" stop-color="#C084FC" />
+      <stop offset="100%" stop-color="#581C87" />
+    </radialGradient>
+  </defs>
+
+  <!-- Forme principale (mise à l'échelle x8) avec bordure claire -->
+  <path d="M 96 40 L 32 104 L 56 128 L 88 128 L 88 104 L 64 104 L 112 56 L 160 104 L 136 104 L 136 128 L 168 128 L 192 104 L 128 40 L 96 40" 
+        fill="#808895"  />
+
+  <!-- Petit cercle bleu (mis à l'échelle x8) -->
+  <circle cx="112" cy="40" r="16" 
+          fill="url(#blueGradient)" 
+          stroke="#808895" 
+          stroke-width="1" />
+
+  <!-- Grand cercle violet (mis à l'échelle x8) -->
+  <circle cx="112" cy="112" r="32" 
+          fill="url(#purpleGradient)" 
+          stroke="#808895" 
+          stroke-width="1" />
+</svg>

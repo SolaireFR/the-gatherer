@@ -25,13 +25,14 @@ jobs:
       GOSVELTE_NPM_TOKEN: ${{ secrets.GOSVELTE_NPM_TOKEN }}
 
     steps:
+      # Versions sur Node 24 (Node 20 deprecie sur les runners), comme la CI de gosvelte
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -41,9 +42,14 @@ jobs:
           version: ${{ env.PNPM_VERSION }}
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      # .env non versionne : sans lui, .gosvelte/generated/env.ts est vide et svelte-check echoue
+      # (« env.ts is not a module ») ; valeurs publiques de .env.example, aucun secret
+      - name: Create .env
+        run: cp .env.example .env
 
       # Acces git au depot prive gosvelte (modules Go)
       - name: Access to gosvelte
@@ -67,7 +73,7 @@ jobs:
         run: go tool gosvelte docker -t "${IMAGE}:${IMAGE_TAG}"
 
       - name: Log in to the Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/SolaireFR/gosvelte/gosvelte-core/settings"
 )
 
 // Réponse type de /v1/conversations avec web_search : le JSON de l'IA est découpé en chunks de texte, entrecoupés de
@@ -42,13 +44,24 @@ func TestParseConversationNews(t *testing.T) {
 	}
 }
 
-// Sans technologie suivie, pas de rubrique « alternatives » ; sinon les technologies sont citées
+// Variables du réglage NEWS_PROMPT remplacées (valeur par défaut ou modifiée) ; format JSON toujours ajouté
 func TestBuildNewsPrompt(t *testing.T) {
 	day := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
-	if p := buildNewsPrompt(day, nil, nil); strings.Contains(p, `"alternatives" :`) || !strings.Contains(p, "09/11/2026") {
-		t.Fatalf("prompt sans technologie inattendu :\n%s", p)
+	p := buildNewsPrompt(day, nil, nil)
+	if !strings.Contains(p, "l'actualité du 09/11/2026") || !strings.Contains(p, "suivantes : aucune (laisse cette rubrique vide)") ||
+		!strings.Contains(p, "rubriques : aucun sujet.") || !strings.HasSuffix(p, responseFormat) {
+		t.Fatalf("prompt par défaut sans configuration inattendu :\n%s", p)
 	}
-	if p := buildNewsPrompt(day, []string{"Go", "Docker"}, []string{"crypto"}); !strings.Contains(p, "suivantes : Go, Docker.") || !strings.Contains(p, "EXCLURE de toutes les rubriques : crypto.") {
-		t.Fatalf("prompt avec technologies inattendu :\n%s", p)
+	if p := buildNewsPrompt(day, []string{"Go", "Docker"}, []string{"crypto"}); !strings.Contains(p, "suivantes : Go, Docker,") ||
+		!strings.Contains(p, "rubriques : crypto.") {
+		t.Fatalf("prompt par défaut avec configuration inattendu :\n%s", p)
+	}
+
+	t.Cleanup(settings.Override("NEWS_PROMPT", "News du {date} sur {technologies}"))
+	if p := buildNewsPrompt(day, []string{"Go"}, nil); p != "News du 09/11/2026 sur Go"+responseFormat {
+		t.Fatalf("prompt modifié inattendu :\n%s", p)
+	}
+	if validatePrompt("News d'hier") == nil {
+		t.Fatal("prompt sans {date} accepté")
 	}
 }

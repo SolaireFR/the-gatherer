@@ -2,15 +2,15 @@ package news
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
 	"strings"
 	"time"
-)
 
-// newsPerSection : nombre maximum de news demandées par rubrique
-const newsPerSection = 10
+	"github.com/SolaireFR/gosvelte/gosvelte-core/settings"
+)
 
 // maxCategoryLen, maxCategoriesPerNews : bornes des catégories inventées par l'IA
 const (
@@ -18,45 +18,57 @@ const (
 	maxCategoriesPerNews = 3
 )
 
-// newsSections : rubriques demandées à l'IA, dans l'ordre d'affichage ; Key = clé du JSON attendu et valeur de News.Section
-var newsSections = []struct{ Key, Ask string }{
-	{"generales", "news générales importantes (monde, France, économie, science...)"},
-	{"tech", "news informatique et technologie (sorties, sécurité, IA, développement, matériel, industrie...)"},
-	{"alternatives", "alternatives récentes (nouveaux outils, forks, projets annoncés ou qui font parler d'eux) aux technologies suivantes : %s. La description précise à quelle technologie c'est une alternative et ce qu'elle apporte"},
-}
+// sectionKeys : rubriques, dans l'ordre d'affichage ; clés du JSON attendu et valeurs de News.Section
+var sectionKeys = []string{"generales", "tech", "alternatives"}
 
-// sectionRank : position de la rubrique dans newsSections (inconnue : à la fin)
+// sectionRank : position de la rubrique dans sectionKeys (inconnue : à la fin)
 func sectionRank(key string) int {
-	if i := slices.IndexFunc(newsSections, func(s struct{ Key, Ask string }) bool { return s.Key == key }); i >= 0 {
+	if i := slices.Index(sectionKeys, key); i >= 0 {
 		return i
 	}
-	return len(newsSections)
+	return len(sectionKeys)
 }
 
-// buildNewsPrompt : un seul prompt pour les trois rubriques ; sans technologie suivie, pas de rubrique « alternatives »
+// newsPrompt : texte du prompt, réglage global modifiable dans /admin > Paramètres (champ sur une ligne : un paragraphe).
+// Variables : {date} (obligatoire), {technologies}, {exclusions} (page Configuration). Le format JSON de la réponse
+// (responseFormat) est toujours ajouté par le code : il conditionne la lecture des news.
+var newsPrompt = settings.String("NEWS_PROMPT", settings.Options{Group: "news",
+	Description: "Prompt envoyé chaque nuit à l'IA. Variables : {date}, {technologies}, {exclusions} ; format JSON de la réponse ajouté automatiquement",
+	MaxLength:   8000, Validate: validatePrompt, Default: "Tu es un journaliste chargé d'une revue de presse quotidienne pour un développeur logiciel senior. " +
+		"Utilise la recherche web pour trouver l'actualité du {date} (la veille). " +
+		"Rubriques : « generales » : jusqu'à 10 news générales importantes (monde, France, économie, science...) ; " +
+		"« tech » : jusqu'à 10 news informatique et technologie (sorties, sécurité, IA, développement, matériel, industrie...) ; " +
+		"« alternatives » : jusqu'à 10 alternatives récentes (nouveaux outils, forks, projets annoncés ou qui font parler d'eux) " +
+		"aux technologies suivantes : {technologies}, la description précise à quelle technologie c'est une alternative et ce qu'elle apporte. " +
+		"Exclure de toutes les rubriques : {exclusions}. " +
+		"Règles : uniquement des faits trouvés par la recherche web, jamais inventés ; chaque news porte le lien exact de l'article source ; " +
+		"titre et description en français, description de 1 à 3 phrases ; 1 à 3 catégories par news, un mot ou une courte expression " +
+		"(30 caractères maximum) sans virgule, en réutilisant les mêmes libellés quand le sujet est identique."})
+
+// validatePrompt : {date} requis (sans lui, l'IA ne sait pas de quel jour donner les news)
+func validatePrompt(v string) error {
+	if !strings.Contains(v, "{date}") {
+		return errors.New("the prompt must contain {date}")
+	}
+	return nil
+}
+
+// responseFormat : ajouté à tout prompt, quel qu'en soit le texte (lu par parseNews)
+const responseFormat = "\n\nRéponds UNIQUEMENT avec un objet JSON, sans aucun autre texte ni balise Markdown, au format :\n" +
+	`{"generales": [{"title": "...", "description": "...", "link": "https://...", "source": "Nom du média", "categories": ["..."]}], "tech": [...], "alternatives": [...]}` + "\n"
+
+// buildNewsPrompt : réglage NEWS_PROMPT aux variables remplacées, puis format de réponse
 func buildNewsPrompt(day time.Time, techs []string, excludes []string) string {
-	prompt := "Tu es un journaliste chargé d'une revue de presse quotidienne pour un développeur logiciel senior.\n"
-	prompt += fmt.Sprintf("Utilise la recherche web pour trouver l'actualité du %s (la veille).\n\nRUBRIQUES :\n", day.Format("02/01/2006"))
-	for _, s := range newsSections {
-		if s.Key == "alternatives" && len(techs) == 0 {
-			continue
-		}
-		ask := s.Ask
-		if strings.Contains(ask, "%s") {
-			ask = fmt.Sprintf(ask, strings.Join(techs, ", "))
-		}
-		prompt += fmt.Sprintf("- \"%s\" : jusqu'à %d %s.\n", s.Key, newsPerSection, ask)
+	technologies, exclusions := "aucune (laisse cette rubrique vide)", "aucun sujet"
+	if len(techs) > 0 {
+		technologies = strings.Join(techs, ", ")
 	}
 	if len(excludes) > 0 {
-		prompt += fmt.Sprintf("- EXCLURE de toutes les rubriques : %s.\n", strings.Join(excludes, ", "))
+		exclusions = strings.Join(excludes, ", ")
 	}
-	prompt += "\nRÈGLES :\n"
-	prompt += "- Uniquement des faits trouvés par la recherche web, jamais inventés. Chaque news porte le lien exact de l'article source.\n"
-	prompt += "- Titre et description en français ; description de 1 à 3 phrases.\n"
-	prompt += fmt.Sprintf("- 1 à %d catégories par news : un mot ou une courte expression (%d caractères maximum), sans virgule. Réutilise les mêmes libellés quand le sujet est identique.\n", maxCategoriesPerNews, maxCategoryLen)
-	prompt += "- Réponds UNIQUEMENT avec un objet JSON, sans aucun autre texte ni balise Markdown.\n\nFormat exigé :\n"
-	prompt += `{"generales": [{"title": "...", "description": "...", "link": "https://...", "source": "Nom du média", "categories": ["..."]}], "tech": [...], "alternatives": [...]}` + "\n"
-	return prompt
+	text := strings.NewReplacer("{date}", day.Format("02/01/2006"), "{technologies}", technologies, "{exclusions}", exclusions).
+		Replace(newsPrompt.Get())
+	return text + responseFormat
 }
 
 // conversationText : texte de la réponse de l'API Conversations. Avec web_search, le contenu est une liste de chunks :
@@ -126,9 +138,9 @@ func parseNews(content string, day string) ([]News, error) {
 		return nil, fmt.Errorf("JSON invalide (%v) : %s", err, truncate(content, 1000))
 	}
 	var items []News
-	for _, s := range newsSections {
-		for _, n := range sections[s.Key] {
-			if item, ok := toNews(n, s.Key, day); ok {
+	for _, key := range sectionKeys {
+		for _, n := range sections[key] {
+			if item, ok := toNews(n, key, day); ok {
 				items = append(items, item)
 			}
 		}

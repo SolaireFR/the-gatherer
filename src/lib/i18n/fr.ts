@@ -28,7 +28,7 @@ export default {
 	topics: {
 		title: 'Configuration',
 		description: "Technologies utilisées et sujets bloqués, envoyés à l'IA à chaque récupération.",
-		intro: "Envoyés à l'IA à chaque récupération (chaque nuit à minuit). Les catégories, elles, sont choisies librement par l'IA.",
+		intro: "Envoyés à l'IA à chaque récupération (chaque nuit à minuit). Les catégories, elles, sont choisies librement par l'IA. Le texte du prompt se modifie dans Administration > Paramètres (NEWS_PROMPT).",
 		tech: {
 			title: 'Technologies utilisées',
 			hint: "L'IA cherche leurs alternatives récentes. Aucune = pas de rubrique Alternatives.",
@@ -73,7 +73,8 @@ export default {
 		groups: { news: 'News' },
 		setting: {
 			MISTRAL_MODEL: 'Modèle Mistral interrogé pour les news',
-			MISTRAL_TEMPERATURE: 'Température du modèle, de 0 (factuel) à 1.5'
+			MISTRAL_TEMPERATURE: 'Température du modèle, de 0 (factuel) à 1.5',
+			NEWS_PROMPT: "Prompt envoyé chaque nuit à l'IA. Variables : {date} (obligatoire), {technologies}, {exclusions} (page Configuration). Le format JSON de la réponse est ajouté automatiquement."
 		}
 	},
 	errors: {

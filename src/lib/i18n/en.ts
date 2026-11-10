@@ -30,7 +30,7 @@ const en = {
 	topics: {
 		title: 'Configuration',
 		description: 'Technologies you use and blocked topics, sent to the AI on every fetch.',
-		intro: 'Sent to the AI on every fetch (every night at midnight). Categories are chosen freely by the AI.',
+		intro: 'Sent to the AI on every fetch (every night at midnight). Categories are chosen freely by the AI. The prompt text can be edited in Administration > Settings (NEWS_PROMPT).',
 		tech: {
 			title: 'Technologies used',
 			hint: 'The AI looks for recent alternatives to them. None = no Alternatives section.',
@@ -75,7 +75,8 @@ const en = {
 		groups: { news: 'News' },
 		setting: {
 			MISTRAL_MODEL: 'Mistral model asked for the news',
-			MISTRAL_TEMPERATURE: 'Model temperature, from 0 (factual) to 1.5'
+			MISTRAL_TEMPERATURE: 'Model temperature, from 0 (factual) to 1.5',
+			NEWS_PROMPT: 'Prompt sent to the AI every night. Variables: {date} (required), {technologies}, {exclusions} (Configuration page). The JSON format of the answer is added automatically.'
 		}
 	},
 	errors: {

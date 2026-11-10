@@ -8,4 +8,5 @@
 ## 2026-11-10
 - [public] News de la veille demandées chaque nuit à minuit à l'IA (recherche web) : générales, tech et alternatives aux technologies utilisées.
 - [public] Favoris : étoile sur chaque news et page Favoris.
+- Prompt des news modifiable dans /admin > Paramètres (`NEWS_PROMPT`, variables `{date}`, `{technologies}`, `{exclusions}`).
 - Projet migré sur gosvelte (Go + SvelteKit) : les anciennes APIs de news (Dev.to, GNews, NewsAPI, CurrentsAPI) sont retirées.

@@ -25,6 +25,16 @@ jobs:
       GOSVELTE_NPM_TOKEN: ${{ secrets.GOSVELTE_NPM_TOKEN }}
 
     steps:
+      # Secret vide = « Invalid username or token » au telechargement de gosvelte-core : erreur explicite des le debut
+      - name: Check gosvelte secrets
+        run: |
+          for name in GOSVELTE_TOKEN GOSVELTE_NPM_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name absent : le creer dans Settings > Secrets and variables > Actions du depot (cf. README de gosvelte)"
+              exit 1
+            fi
+          done
+
       # Versions sur Node 24 (Node 20 deprecie sur les runners), comme la CI de gosvelte
       - name: Checkout repository
         uses: actions/checkout@v7

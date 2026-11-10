@@ -3,20 +3,23 @@ services:
     image: ghcr.io/solairefr/the-gatherer:1.0.0
     container_name: the-gatherer-app
     volumes:
+      # Image gosvelte (scratch) lancée en utilisateur 65532 : dossier à lui donner (chown -R 65532:65532)
       - /docker/volumes/the-gatherer:/app/data
     environment:
-      - NEWS_API_KEY=${NEWS_API_KEY}
-      - GNEWS_API_KEY=${GNEWS_API_KEY}
-      - CURRENTS_API_KEY=${CURRENTS_API_KEY}
-      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
-      - SITE_PASSWORD=${SITE_PASSWORD}
-      - MISTRAL_API_URL=${MISTRAL_API_URL}
-      - MISTRAL_MODEL=${MISTRAL_MODEL}
-      - MISTRAL_TEMPERATURE=${MISTRAL_TEMPERATURE}
-      - DEVTO_API_URL=${DEVTO_API_URL}
-      - CURRENTS_API_URL=${CURRENTS_API_URL}
-      - GNEWS_API_URL=${GNEWS_API_URL}
-      - NEWSAPI_API_URL=${NEWSAPI_API_URL}
+      # Port de l'ancienne image : proxy inverse inchangé (défaut gosvelte : 3333)
+      - PORT=8080
+      # News récupérées à minuit, heure de Paris (fuseaux embarqués dans le binaire)
+      - TZ=Europe/Paris
+      - PUBLIC_PROJECT_NAME=The Gatherer
+      - DB_NAME=app_db
+      - SQLITE_PATH=./data
+      # Secrets : longs et aléatoires (openssl rand -base64 48), cf. .env.example
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - SETTINGS_SECRET_KEY=${SETTINGS_SECRET_KEY}
+      # Compte admin créé au premier démarrage (identifiant : admin)
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      # Clé Mistral (ou /admin > Clés d'API, prioritaire dès qu'une clé y est enregistrée)
+      - API_MISTRAL_KEYS=${API_MISTRAL_KEYS}
     restart: unless-stopped
     networks:
       - the-gatherer-network

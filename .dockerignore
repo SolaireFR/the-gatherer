@@ -1,6 +1,0 @@
-.env*
-docker-compose.yml
-docker-compose.prod.yml
-.git*
-data/
-.gocache/

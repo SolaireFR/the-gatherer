@@ -1,0 +1,3 @@
+{
+	"extends": "./.gosvelte/tsconfig.json"
+}

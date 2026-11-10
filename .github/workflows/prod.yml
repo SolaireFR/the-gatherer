@@ -7,6 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
+  NODE_VERSION: 24
+  PNPM_VERSION: 12.11.2
 
 jobs:
   build-and-push:
@@ -14,25 +16,55 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # gosvelte vient du depot prive SolaireFR/gosvelte : modules Go et gosvelte-front (GitHub Packages).
+      # Secrets a creer dans le depot : GOSVELTE_TOKEN (fine-grained, Contents en lecture sur SolaireFR/gosvelte)
+      # et GOSVELTE_NPM_TOKEN (classic, read:packages)
+      GOPRIVATE: github.com/SolaireFR/*
+      GOSVELTE_TOKEN: ${{ secrets.GOSVELTE_TOKEN }}
+      GOSVELTE_NPM_TOKEN: ${{ secrets.GOSVELTE_NPM_TOKEN }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      # Nom du depot en minuscules (contrainte GHCR)
-      - name: Downcase repository name
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Acces git au depot prive gosvelte (modules Go)
+      - name: Access to gosvelte
+        run: git config --global url."https://x-access-token:${GOSVELTE_TOKEN}@github.com/SolaireFR/".insteadOf "https://github.com/SolaireFR/"
+
+      # Nom du depot en minuscules (contrainte GHCR) ; tag au format <10 premiers caracteres du hash du commit>-prod
+      - name: Compute image name and tag
         run: |
-          echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
+          echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> ${GITHUB_ENV}
+          echo "IMAGE_TAG=$(echo "${GITHUB_SHA}" | cut -c1-10)-prod" >> ${GITHUB_ENV}
 
-      # Tag au format <10 premiers caracteres du hash du commit>-prod
-      - name: Compute image tag
-        run: |
-          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-10)
-          echo "IMAGE_TAG=${SHORT_SHA}-prod" >> ${GITHUB_ENV}
-          echo "Tag genere : ${SHORT_SHA}-prod"
+      # svelte-check + go vet (commande gosvelte a la version de go.mod)
+      - name: Check
+        run: go tool gosvelte check
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Test
+        run: go test ./back/...
+
+      # Image scratch : binaire Linux statique, front embarque (PUBLIC_* lues dans .env.example)
+      - name: Build Docker image
+        run: go tool gosvelte docker -t "${IMAGE}:${IMAGE_TAG}"
 
       - name: Log in to the Container Registry
         uses: docker/login-action@v3
@@ -41,12 +73,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.prod
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Push Docker image
+        run: |
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          echo "Image publiee : ${IMAGE}:${IMAGE_TAG}"

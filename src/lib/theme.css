@@ -1,0 +1,10 @@
+/*
+ * Thème de l'application : redéfinir ici UNIQUEMENT les variables de @solairefr/gosvelte-front/theme.css qui changent.
+ * Ces valeurs gagnent toujours sur le thème par défaut.
+ */
+:root {
+	/* Exemple : couleur de marque
+	--primary: #2563eb;
+	--primary-hover: #1d4ed8;
+	*/
+}

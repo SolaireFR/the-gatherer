@@ -1,0 +1,14 @@
+{
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "go tool gosvelte dev",
+		"build": "go tool gosvelte build",
+		"check": "go tool gosvelte check"
+	},
+	"devDependencies": {
+		"@solairefr/gosvelte-front": "0.0.0-g14a79f40ee2a",
+		"@sveltejs/kit": "^2.70.3",
+		"svelte": "^5.57.2"
+	}
+}

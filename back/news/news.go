@@ -20,8 +20,8 @@ import (
 // isoDay : format des jours (News.Day, FetchRun.Day, paramètre ?day=)
 const isoDay = "2006-01-02"
 
-// adminOnly : outil personnel, toutes les routes sont réservées au compte admin (inscription libre à fermer dans /admin)
-var adminOnly = auth.Require("admin")
+// memberOnly : routes réservées au rôle basic-user (admin passe partout) ; nouveau compte = aucun rôle, à attribuer dans /admin/users
+var memberOnly = auth.Require("basic-user")
 
 // News : une actualité renvoyée par l'IA
 type News struct {
@@ -56,10 +56,10 @@ func (n News) Fields() []database.Field {
 
 // --- Routes (fonction …Endpoints lue par gosvelte generate) ---
 func RegisterNewsEndpoints() {
-	server.GET("/news/days", ListNewsDays, adminOnly)
-	server.GET("/news/favorites", ListFavoriteNews, adminOnly)
-	server.GET("/news", ListNews, adminOnly)
-	server.POST("/news/{id}/favorite", ToggleFavorite, adminOnly)
+	server.GET("/news/days", ListNewsDays, memberOnly)
+	server.GET("/news/favorites", ListFavoriteNews, memberOnly)
+	server.GET("/news", ListNews, memberOnly)
+	server.POST("/news/{id}/favorite", ToggleFavorite, memberOnly)
 }
 
 func init() {

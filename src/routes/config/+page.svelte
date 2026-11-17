@@ -65,7 +65,7 @@
 
 <!-- Titre et description de la page : +page.ts (SEO, cf. App.PageData) -->
 
-<RequireAuth role="admin">
+<RequireAuth role="basic-user">
 	<div class="container">
 		<header>
 			<h1>{t('topics.title')}</h1>

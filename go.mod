@@ -2,7 +2,7 @@ module app
 
 go 1.27.3
 
-require github.com/SolaireFR/gosvelte/gosvelte-core v0.0.0-20261109094328-14a79f40ee2a
+require github.com/SolaireFR/gosvelte/gosvelte-core v0.0.0-20261117004448-3eb1de3328e4
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

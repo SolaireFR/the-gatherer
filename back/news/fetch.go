@@ -85,8 +85,8 @@ var running sync.Mutex
 
 // --- Routes (fonction …Endpoints lue par gosvelte generate) ---
 func RegisterFetchEndpoints() {
-	server.GET("/fetch-runs", ListFetchRuns, adminOnly)
-	server.POST("/fetch-runs", StartFetch, adminOnly)
+	server.GET("/fetch-runs", ListFetchRuns, memberOnly)
+	server.POST("/fetch-runs", StartFetch, memberOnly)
 }
 
 func init() {

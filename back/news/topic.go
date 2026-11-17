@@ -44,9 +44,9 @@ type NewTopicDto struct {
 
 // --- Routes (fonction …Endpoints lue par gosvelte generate) ---
 func RegisterTopicEndpoints() {
-	server.GET("/topics", ListTopics, adminOnly)
-	server.POST("/topics", CreateTopic, adminOnly)
-	server.DELETE("/topics/{id}", DeleteTopic, adminOnly)
+	server.GET("/topics", ListTopics, memberOnly)
+	server.POST("/topics", CreateTopic, memberOnly)
+	server.DELETE("/topics/{id}", DeleteTopic, memberOnly)
 }
 
 func init() {

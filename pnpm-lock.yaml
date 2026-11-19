@@ -9,8 +9,8 @@ importers:
   .:
     devDependencies:
       '@solairefr/gosvelte-front':
-        specifier: 0.0.0-g3eb1de3328e4
-        version: 0.0.0-g3eb1de3328e4(@sveltejs/kit@2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0)))(jiti@2.7.0)(picomatch@4.0.7)(svelte@5.57.3)
+        specifier: 0.0.0-g21483f0b3144
+        version: 0.0.0-g21483f0b3144(@sveltejs/kit@2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0)))(jiti@2.7.0)(picomatch@4.0.7)(svelte@5.57.3)
       '@sveltejs/kit':
         specifier: ^2.70.3
         version: 2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0))
@@ -141,8 +141,8 @@ packages:
   '@rolldown/pluginutils@1.1.0':
     resolution: {integrity: sha512-K+NU2HDCEem4sClgHH4ZZXwdJeNFkJo+hRk479DIwdIviAPN2hFJH1KHHwg8CxHQXvi0M5XY4deTXINfIiSG6w==}
 
-  '@solairefr/gosvelte-front@0.0.0-g3eb1de3328e4':
-    resolution: {integrity: sha512-4U/ylYAAf+5o5ioAE9bKwUy4CNP+xqkXnZLmZlb+8SBU+sxdxEpIgmdPu0TEhFiPAmgEg6GJEmodxo02Qvi1CQ==, tarball: https://npm.pkg.github.com/download/@solairefr/gosvelte-front/0.0.0-g3eb1de3328e4/e7190bd09a3da3557ab233b28dd420564c011963}
+  '@solairefr/gosvelte-front@0.0.0-g21483f0b3144':
+    resolution: {integrity: sha512-Vx5w4KVrFl2nZIvlh9vWLXW88/ukNXI/fhg7LhqNev95p+iaA9g40m7Y9/RlmyX1XDvC7K9aBWK1Y//WseTevQ==, tarball: https://npm.pkg.github.com/download/@solairefr/gosvelte-front/0.0.0-g21483f0b3144/c8b718e51c17c0a65a7068b078c6b87e722d27fd}
     hasBin: true
     peerDependencies:
       '@sveltejs/kit': ^2.70.3
@@ -662,7 +662,7 @@ snapshots:
 
   '@rolldown/pluginutils@1.1.0': {}
 
-  '@solairefr/gosvelte-front@0.0.0-g3eb1de3328e4(@sveltejs/kit@2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0)))(jiti@2.7.0)(picomatch@4.0.7)(svelte@5.57.3)':
+  '@solairefr/gosvelte-front@0.0.0-g21483f0b3144(@sveltejs/kit@2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0)))(jiti@2.7.0)(picomatch@4.0.7)(svelte@5.57.3)':
     dependencies:
       '@sveltejs/adapter-static': 3.0.11(@sveltejs/kit@2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0)))
       '@sveltejs/kit': 2.70.4(@sveltejs/vite-plugin-svelte@7.3.1(svelte@5.57.3)(vite@8.3.7(jiti@2.7.0)))(svelte@5.57.3)(typescript@6.0.3)(vite@8.3.7(jiti@2.7.0))

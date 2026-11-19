@@ -1,2 +1,2 @@
 minimumReleaseAgeExclude:
-  - '@solairefr/gosvelte-front@0.0.0-g3eb1de3328e4'
+  - '@solairefr/gosvelte-front@0.0.0-g21483f0b3144 || 0.0.0-g3eb1de3328e4'

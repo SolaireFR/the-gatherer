@@ -16,6 +16,9 @@ import (
 
 	// Authentification
 	_ "github.com/SolaireFR/gosvelte/gosvelte-core/auth/basic"
+	// Connexion Google (« Continuer avec Google », FedCM) : compte de même email connecté ou créé ; active dès que le
+	// réglage GOOGLE_CLIENT_ID est rempli (/admin > Paramètres)
+	_ "github.com/SolaireFR/gosvelte/gosvelte-core/auth/google"
 
 	// Administration : page /admin réservée au rôle admin et invisible pour les autres (404), mot de passe redemandé
 	// (ADMIN_SUDO_MINUTES), IP filtrées (ADMIN_ALLOWED_IPS) ; tableau de bord, données, réglages chiffrés (SETTINGS_SECRET_KEY),
